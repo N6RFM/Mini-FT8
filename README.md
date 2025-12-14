@@ -1,3 +1,5 @@
+I have got ft8 decoder working on a .wav file and encoder working to print 79 tones. UI is nice and The major task is to enable USB Host.
+
 # MiniFT8 (ESP32-S3 / M5 Cardputer)
 
 Offline FT8 decoder/utility for M5 Cardputer (ESP32-S3) with menu-driven UI, software RTC, host file upload, and WAV streaming decode.
