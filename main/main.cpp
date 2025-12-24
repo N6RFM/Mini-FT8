@@ -29,11 +29,12 @@ extern "C" {
 #include <dirent.h>
 #include <sys/stat.h>
 #include "driver/usb_serial_jtag.h"
+#include "driver/uart.h"
+#include "driver/gpio.h"
 #include <cctype>
 #include <cstdlib>
 #include <ctime>
 #include "esp_timer.h"
-#include "stream_wav.h"
 #include "stream_uac.h"
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
@@ -249,6 +250,11 @@ static void poll_host_uart();
 static void poll_ble_uart();
 static void enter_mode(UIMode new_mode);
 static bool g_rx_dirty = false;
+
+static constexpr uart_port_t SOFT_UART_NUM = UART_NUM_1;
+static constexpr int SOFT_UART_TX_PIN = 1;  // G1
+static constexpr int SOFT_UART_RX_PIN = 2;  // G2
+
 
 static std::vector<std::string> g_list_lines = {
     "10:34 20m WA4HR",
@@ -1383,6 +1389,36 @@ static void save_station_data() {
   fclose(f);
 }
 
+static void init_soft_uart() {
+  static bool initialized = false;
+  if (initialized) return;
+  initialized = true;
+
+  uart_config_t cfg = {};
+  cfg.baud_rate = 115200;
+  cfg.data_bits = UART_DATA_8_BITS;
+  cfg.parity = UART_PARITY_DISABLE;
+  cfg.stop_bits = UART_STOP_BITS_1;
+  cfg.flow_ctrl = UART_HW_FLOWCTRL_DISABLE;
+#ifdef UART_SCLK_REF_TICK
+  cfg.source_clk = UART_SCLK_REF_TICK; // 1 MHz ref tick gives precise low baud divisors
+#else
+  cfg.source_clk = UART_SCLK_DEFAULT;
+#endif
+
+  ESP_ERROR_CHECK(uart_driver_install(SOFT_UART_NUM, 512, 0, 0, nullptr, 0));
+  ESP_ERROR_CHECK(uart_param_config(SOFT_UART_NUM, &cfg));
+  ESP_ERROR_CHECK(uart_set_pin(SOFT_UART_NUM, SOFT_UART_TX_PIN, SOFT_UART_RX_PIN,
+                               UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+  // Match known-good STM32 setup: invert TX/RX levels (idle still high at line), TX-only use
+  // uart_set_line_inverse(SOFT_UART_NUM, UART_SIGNAL_TXD_INV | UART_SIGNAL_RXD_INV);
+  ESP_ERROR_CHECK(gpio_set_drive_capability((gpio_num_t)SOFT_UART_TX_PIN, GPIO_DRIVE_CAP_3));
+  ESP_LOGI(TAG, "Soft UART ready on GPIO%d/GPIO%d @ %d baud",
+           SOFT_UART_TX_PIN, SOFT_UART_RX_PIN, cfg.baud_rate);
+  uart_write_bytes(SOFT_UART_NUM, "Hello World\n", 12);  //debug
+}
+
+
 static void enter_mode(UIMode new_mode) {
   ESP_LOGI("MODE", "Switching %d -> %d", (int)ui_mode, (int)new_mode);
   {
@@ -1396,10 +1432,6 @@ static void enter_mode(UIMode new_mode) {
   if (ui_mode == UIMode::STATUS && new_mode != UIMode::STATUS) {
     status_edit_idx = -1;
     status_edit_buffer.clear();
-  }
-  // Stop UAC streaming when leaving HOST mode
-  if (ui_mode == UIMode::HOST && new_mode != UIMode::HOST) {
-    uac_stop();
   }
   ui_mode = new_mode;
   rx_flash_idx = -1;
@@ -1464,8 +1496,9 @@ static void app_task_core0(void* /*param*/) {
     .format_if_mount_failed = false
   };
   ESP_ERROR_CHECK(esp_vfs_spiffs_register(&conf));
-
+  //init_soft_uart();
   ui_init();
+  
   std::vector<UiRxLine> empty;
   ui_set_rx_list(empty);
   ui_draw_rx();
@@ -1562,16 +1595,19 @@ static void app_task_core0(void* /*param*/) {
   menu_flash_tick();
   rx_flash_tick();
 
-  auto try_start_stream = [&](char key) {
-    if (!g_streaming && (key == 'x' || key == 'X') && ui_mode != UIMode::HOST) {
-      g_streaming = true;
-      xTaskCreatePinnedToCore(stream_wav_task, "stream_wav", 8192, (void*)"/spiffs/kfs40m.wav", 4, NULL, 1);
-      return true;
+  // Toggle UAC decode with 'x' (start; no stop to avoid crash). On stop, decode runs idle.
+  if (c == 'x' || c == 'X') {
+    if (uac_is_streaming()) {
+      debug_log_line("UAC already streaming");
+    } else if (uac_start()) {
+      debug_log_line("UAC start");
+    } else {
+      debug_log_line("UAC start failed");
     }
-    return false;
-  };
-
-  try_start_stream(c);
+    last_key = c;
+    vTaskDelay(pdMS_TO_TICKS(10));
+    continue;
+  }
 
   if (g_rx_dirty && ui_mode == UIMode::RX) {
       ui_set_rx_list(g_rx_lines);
@@ -1620,12 +1656,6 @@ static void app_task_core0(void* /*param*/) {
           rx_flash_deadline = rtc_now_ms() + 500;
           ui_draw_rx(rx_flash_idx);
         }
-    if (c == 'x' || c == 'X') {
-      if (!g_streaming) {
-        g_streaming = true;
-        xTaskCreatePinnedToCore(stream_wav_task, "stream_wav", 8192, (void*)"/spiffs/kfs40m.wav", 5, NULL, 1);
-            }
-          }
           break;
         }
         case UIMode::TX: {
