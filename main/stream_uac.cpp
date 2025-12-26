@@ -366,6 +366,9 @@ static void stream_uac_task(void* arg) {
     const int target_blocks = 80;
     int ft8_buffer_idx = 0;  // Current position in ft8_buffer
     TickType_t next_wake = xTaskGetTickCount();
+    int slot_blocks = 0;
+    int64_t slot_idx = rtc_now_ms() / 15000;
+    int64_t slot_start_ms = slot_idx * 15000;
 
     while (!s_stop_requested && s_mic_handle != NULL) {
         // Read USB audio data
@@ -435,18 +438,27 @@ static void stream_uac_task(void* arg) {
                 // Maintain 160ms timing
                 vTaskDelayUntil(&next_wake, pdMS_TO_TICKS(160));
 
-                // Check if we have enough blocks for decoding
-                if (mon.wf.num_blocks >= target_blocks) {
-                    if (mon.wf.num_blocks > 0) {
-                        ESP_LOGI(TAG, "Triggering decode with %d blocks", mon.wf.num_blocks);
-
-                        // Decode synchronously (or could spawn decode task like stream_wav)
-                        decode_monitor_results(&mon, &mon_cfg, false);
-                    }
-
-                    // Reset for next slot
+                // Align decode to 15s boundaries based on RTC
+                slot_blocks++;
+                int64_t now_idx = rtc_now_ms() / 15000;
+                if (now_idx != slot_idx) {
+                    ESP_LOGI(TAG, "Slot boundary %lld->%lld blocks=%d wf=%d",
+                             (long long)slot_idx, (long long)now_idx,
+                             slot_blocks, mon.wf.num_blocks);
+                    // Reset counters at the boundary
+                    slot_idx = now_idx;
+                    slot_start_ms = slot_idx * 15000;
+                    slot_blocks = 0;
+                    mon.wf.num_blocks = 0;
+                    monitor_reset(&mon);
+                    next_wake = xTaskGetTickCount();
+                } else if (slot_blocks >= 79 && mon.wf.num_blocks >= 79) {
+                    ESP_LOGI(TAG, "Triggering decode at slot %lld blocks=%d wf=%d",
+                             (long long)slot_idx, slot_blocks, mon.wf.num_blocks);
+                    decode_monitor_results(&mon, &mon_cfg, false);
                     monitor_reset(&mon);
                     mon.wf.num_blocks = 0;
+                    slot_blocks = 0;
                     next_wake = xTaskGetTickCount();
                 }
             }
