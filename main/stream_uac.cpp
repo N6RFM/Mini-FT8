@@ -440,6 +440,10 @@ static void stream_uac_task(void* arg) {
 
             // When we have a full block (1920 samples = 160ms)
             if (ft8_buffer_idx >= block_samples) {
+                // Yield to allow IDLE task to run and reset watchdog
+                // Note: taskYIELD() only yields to equal/higher priority tasks,
+                // but IDLE is priority 0, so we need vTaskDelay instead
+                vTaskDelay(1);
                 // Apply gain normalization and log RMS (block-level AGC)
                 double acc = 0.0;
                 for (int j = 0; j < block_samples; ++j) {
