@@ -44,6 +44,11 @@ void uac_stop(void);
 // Returns pointer to static buffer, do not free
 const char* uac_get_status_string(void);
 
+// Get debug info about last USB sample (for on-screen display)
+// Returns pointer to static buffer, do not free
+const char* uac_get_debug_line1(void);
+const char* uac_get_debug_line2(void);
+
 #ifdef __cplusplus
 }
 #endif

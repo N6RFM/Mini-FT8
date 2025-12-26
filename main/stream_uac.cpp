@@ -7,7 +7,6 @@
 #include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_err.h"
-#include "esp_heap_caps.h"
 #include "usb/usb_host.h"
 #include "usb/uac_host.h"
 
@@ -39,8 +38,9 @@ int64_t rtc_now_ms();
 #define TASK_STACK_SIZE         4096
 #define STREAM_TASK_STACK_SIZE  8192
 
-// UAC read buffer size (bytes)
-#define UAC_READ_BUFFER_SIZE    4096
+// UAC read buffer size (bytes) - must be multiple of 288 (USB transfer size at 48kHz/24bit/stereo)
+// 288 bytes = 48 stereo samples per 1ms USB transfer, 4608 = 288 * 16
+#define UAC_READ_BUFFER_SIZE    4608
 
 // Event types for internal queue
 typedef enum {
@@ -74,17 +74,12 @@ static TaskHandle_t s_stream_task_handle = NULL;
 static volatile bool s_stop_requested = false;
 static char s_status_string[64] = "Idle";
 
+// Debug display buffers
+static char s_debug_line1[64] = "";
+static char s_debug_line2[64] = "";
+
 // Resampler state
 static resample_state_t s_resample_state;
-static void log_heap_stats(const char* where) {
-    size_t free_def = heap_caps_get_free_size(MALLOC_CAP_DEFAULT);
-    size_t largest_def = heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT);
-    size_t free_int = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
-    size_t largest_int = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
-    ESP_LOGI(TAG, "HEAP[%s] free=%u largest=%u int_free=%u int_largest=%u",
-             where, (unsigned)free_def, (unsigned)largest_def,
-             (unsigned)free_int, (unsigned)largest_int);
-}
 
 // Forward declarations
 static void usb_lib_task(void* arg);
@@ -124,16 +119,6 @@ static void push_waterfall_latest(const monitor_t& mon) {
     }
 
     ui_push_waterfall_row(scaled, width);
-
-    // Debug: log waterfall max occasionally to verify signal presence
-    static int wf_log = 0;
-    if ((wf_log++ % 40) == 0) { // roughly every ~6s
-        uint8_t max_scaled = 0;
-        for (int i = 0; i < width; ++i) {
-            if (scaled[i] > max_scaled) max_scaled = scaled[i];
-        }
-        ESP_LOGI(TAG, "Waterfall row max=%u num_bins=%d freq_osr=%d", max_scaled, num_bins, freq_osr);
-    }
 }
 
 // UAC device callback
@@ -165,7 +150,7 @@ static void uac_device_callback(uac_host_device_handle_t handle,
 static void uac_driver_callback(uint8_t addr, uint8_t iface_num,
                                  const uac_host_driver_event_t event,
                                  void* arg) {
-    ESP_LOGI(TAG, "UAC drv evt addr:%d iface:%d evt:%d", addr, iface_num, event);
+    ESP_LOGI(TAG, "UAC driver callback - addr:%d, iface:%d, event:%d", addr, iface_num, event);
 
     uac_event_t evt = {
         .type = UAC_EVT_DRIVER,
@@ -273,26 +258,8 @@ static void uac_lib_task(void* arg) {
                         continue;
                     }
 
-                    // Print device info and alts
-                    uac_host_dev_info_t dev_info = {};
-                    if (uac_host_get_device_info(handle, &dev_info) == ESP_OK) {
-                        ESP_LOGI(TAG, "UAC dev addr:%d type:%d iface:%d alts:%d VID:0x%04X PID:0x%04X",
-                                 dev_info.addr, dev_info.type, dev_info.iface_num,
-                                 dev_info.iface_alt_num, dev_info.VID, dev_info.PID);
-                        // Alt settings are numbered from 1..iface_alt_num; alt 0 is typically zero-bandwidth.
-                        for (int alt = 1; alt <= dev_info.iface_alt_num; ++alt) {
-                            uac_host_dev_alt_param_t altp = {};
-                            if (uac_host_get_device_alt_param(handle, alt, &altp) == ESP_OK) {
-                                ESP_LOGI(TAG, "  Alt[%d]: fmt=%u ch=%u bits=%u freq_type=%u f0=%u f1=%u",
-                                         alt, altp.format, altp.channels, altp.bit_resolution,
-                                         altp.sample_freq_type, altp.sample_freq[0], altp.sample_freq[1]);
-                            } else {
-                                ESP_LOGW(TAG, "  Alt[%d]: get_param failed", alt);
-                            }
-                        }
-                    } else {
-                        ESP_LOGW(TAG, "uac_host_get_device_info failed");
-                    }
+                    // Print device info
+                    uac_host_printf_device_param(handle);
 
                     // Try to start with required format: 24-bit/48kHz/stereo
                     uac_host_stream_config_t stm_config = {
@@ -354,32 +321,36 @@ static void stream_uac_task(void* arg) {
 
     // Initialize resampler
     resample_init(&s_resample_state);
-    log_heap_stats("uac_start");
 
-    // Initialize FT8 monitor (waterfall/decoder)
+    // Wait until the next 15s boundary
+    {
+        int64_t now_ms = rtc_now_ms();
+        int64_t rem = now_ms % 15000;
+        int64_t wait_ms = (rem < 100) ? 0 : (15000 - rem);
+        if (wait_ms > 0) {
+            vTaskDelay(pdMS_TO_TICKS((uint32_t)wait_ms));
+        }
+    }
+
+    // Initialize FT8 monitor
     monitor_config_t mon_cfg = {
         .f_min = 200.0f,
         .f_max = 3000.0f,
         .sample_rate = FT8_SAMPLE_RATE,
         .time_osr = 1,
-        .freq_osr = 2,  // finer bins; relies on freed BLE RAM
+        .freq_osr = 2,
         .protocol = FTX_PROTOCOL_FT8
     };
 
     monitor_t mon;
     monitor_init(&mon, &mon_cfg);
     monitor_reset(&mon);
-    log_heap_stats("after_monitor_init");
-
-    const int target_blocks = 81; // full FT8 slot (160 ms * 81 ≈ 12.96 s)
-    const int block_samples = mon.block_size; // 160 ms @ 12 kHz
 
     // Allocate buffers
     uint8_t* usb_buffer = (uint8_t*)heap_caps_malloc(UAC_READ_BUFFER_SIZE, MALLOC_CAP_DEFAULT);
-    float* ft8_buffer = (float*)heap_caps_malloc(sizeof(float) * block_samples, MALLOC_CAP_DEFAULT);
+    float* ft8_buffer = (float*)heap_caps_malloc(sizeof(float) * mon.block_size, MALLOC_CAP_DEFAULT);
     // Intermediate buffer for 48kHz mono samples (max: 4096 bytes / 6 = 682 stereo samples)
     float* temp_12k = (float*)heap_caps_malloc(sizeof(float) * 1024, MALLOC_CAP_DEFAULT);
-    log_heap_stats("uac_buffers_allocated");
 
     if (!usb_buffer || !ft8_buffer || !temp_12k) {
         ESP_LOGE(TAG, "Buffer allocation failed");
@@ -392,23 +363,9 @@ static void stream_uac_task(void* arg) {
         return;
     }
 
+    const int target_blocks = 80;
     int ft8_buffer_idx = 0;  // Current position in ft8_buffer
     TickType_t next_wake = xTaskGetTickCount();
-    int slot_blocks = 0;
-    int64_t slot_start_ms = 0;
-
-    // Align start to the current 15-second boundary using RTC
-    {
-        int64_t now_ms = rtc_now_ms();
-        int64_t rem = now_ms % 15000;
-        int64_t wait_ms = (rem < 100) ? 0 : (15000 - rem);
-        ESP_LOGI(TAG, "Aligning to slot: now=%lldms rem=%lldms wait=%lldms", (long long)now_ms, (long long)rem, (long long)wait_ms);
-        if (wait_ms > 0) {
-            vTaskDelay(pdMS_TO_TICKS((uint32_t)wait_ms));
-            now_ms = rtc_now_ms();
-        }
-        slot_start_ms = now_ms - (now_ms % 15000);
-    }
 
     while (!s_stop_requested && s_mic_handle != NULL) {
         // Read USB audio data
@@ -425,9 +382,23 @@ static void stream_uac_task(void* arg) {
             continue;
         }
 
-        // Convert USB audio to FT8 format
-        // 24-bit stereo = 6 bytes per sample pair
+        // With 4608-byte buffer (multiple of 288 USB transfer size), reads should be aligned
         int num_stereo_samples = bytes_read / 6;
+        int remainder = bytes_read % 6;
+
+        // Debug display
+        if (num_stereo_samples > 0) {
+            int32_t val = usb_buffer[0] | (usb_buffer[1] << 8) | (usb_buffer[2] << 16);
+            if (val & 0x800000) val |= 0xFF000000;
+            bool l_eq_r = (usb_buffer[0] == usb_buffer[3]) &&
+                          (usb_buffer[1] == usb_buffer[4]) &&
+                          (usb_buffer[2] == usb_buffer[5]);
+            snprintf(s_debug_line1, sizeof(s_debug_line1),
+                     "v=%ld %s", (long)val, l_eq_r ? "L=R" : "L!=R");
+            snprintf(s_debug_line2, sizeof(s_debug_line2),
+                     "rd=%lu %%6=%d", (unsigned long)bytes_read, remainder);
+        }
+
         if (num_stereo_samples == 0) continue;
 
         // Convert and resample: 24-bit/48kHz/stereo -> 12kHz mono float
@@ -439,28 +410,21 @@ static void stream_uac_task(void* arg) {
             ft8_buffer[ft8_buffer_idx++] = temp_12k[i];
 
             // When we have a full block (1920 samples = 160ms)
-            if (ft8_buffer_idx >= block_samples) {
-                // Yield to allow IDLE task to run and reset watchdog
-                // Note: taskYIELD() only yields to equal/higher priority tasks,
-                // but IDLE is priority 0, so we need vTaskDelay instead
-                vTaskDelay(1);
-                // Apply gain normalization and log RMS (block-level AGC)
+            if (ft8_buffer_idx >= mon.block_size) {
+                // Apply gain normalization (same as stream_wav.cpp)
                 double acc = 0.0;
-                for (int j = 0; j < block_samples; ++j) {
+                for (int j = 0; j < mon.block_size; ++j) {
                     acc += fabsf(ft8_buffer[j]);
                 }
-                float level = (float)(acc / block_samples);
-                float gain = (level > 1e-6f) ? 0.5f / level : 1.0f; // target ~0.5 avg abs
+                float level = (float)(acc / mon.block_size);
+                float gain = (level > 1e-6f) ? 0.1f / level : 1.0f;
                 if (gain < 0.1f) gain = 0.1f;
-                if (gain > 30.0f) gain = 30.0f;
-                for (int j = 0; j < block_samples; ++j) {
+                if (gain > 10.0f) gain = 10.0f;
+                for (int j = 0; j < mon.block_size; ++j) {
                     ft8_buffer[j] *= gain;
                 }
-                static int rms_log_count = 0;
-                if ((rms_log_count++ % 30) == 0) { // every ~5s
-                    ESP_LOGI(TAG, "Block RMS avg=%.5f gain=%.2f post=%.3f", level, gain, level * gain);
-                }
 
+                // Process through monitor
                 if (mon.wf.num_blocks < target_blocks) {
                     monitor_process(&mon, ft8_buffer);
                     push_waterfall_latest(mon);
@@ -468,27 +432,21 @@ static void stream_uac_task(void* arg) {
 
                 ft8_buffer_idx = 0;
 
-                // Keep pacing close to real-time
+                // Maintain 160ms timing
                 vTaskDelayUntil(&next_wake, pdMS_TO_TICKS(160));
 
-                // Track slot progression and decode at 79 blocks; resync to RTC every 15s.
-                slot_blocks++;
-                int64_t now_ms = rtc_now_ms();
-                if (slot_blocks >= 79) {
-                    ESP_LOGI(TAG, "Triggering decode slot=%lld blocks=%d", (long long)(slot_start_ms / 15000), slot_blocks);
-                    decode_monitor_results(&mon, &mon_cfg, false);
+                // Check if we have enough blocks for decoding
+                if (mon.wf.num_blocks >= target_blocks) {
+                    if (mon.wf.num_blocks > 0) {
+                        ESP_LOGI(TAG, "Triggering decode with %d blocks", mon.wf.num_blocks);
+
+                        // Decode synchronously (or could spawn decode task like stream_wav)
+                        decode_monitor_results(&mon, &mon_cfg, false);
+                    }
+
+                    // Reset for next slot
                     monitor_reset(&mon);
                     mon.wf.num_blocks = 0;
-                    slot_blocks = 0;
-                    slot_start_ms = now_ms - (now_ms % 15000);
-                    next_wake = xTaskGetTickCount();
-                } else if (now_ms - slot_start_ms >= 15000) {
-                    // Slot rolled over unexpectedly; reset buffers and counters
-                    ESP_LOGW(TAG, "Slot rollover at %lldms, resetting", (long long)(now_ms - slot_start_ms));
-                    monitor_reset(&mon);
-                    mon.wf.num_blocks = 0;
-                    slot_blocks = 0;
-                    slot_start_ms = now_ms - (now_ms % 15000);
                     next_wake = xTaskGetTickCount();
                 }
             }
@@ -599,4 +557,12 @@ void uac_stop(void) {
 
 const char* uac_get_status_string(void) {
     return s_status_string;
+}
+
+const char* uac_get_debug_line1(void) {
+    return s_debug_line1;
+}
+
+const char* uac_get_debug_line2(void) {
+    return s_debug_line2;
 }

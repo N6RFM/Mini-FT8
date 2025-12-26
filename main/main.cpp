@@ -1486,7 +1486,6 @@ static void enter_mode(UIMode new_mode) {
       // Start UAC audio streaming
       g_host_lines.clear();
       g_host_lines.push_back("USB Audio Host Mode");
-      g_host_lines.push_back("-------------------");
       if (uac_start()) {
         g_host_lines.push_back("Starting USB host...");
         g_host_lines.push_back("Connect 24-bit/48kHz");
@@ -1563,13 +1562,18 @@ static void app_task_core0(void* /*param*/) {
     TickType_t now = xTaskGetTickCount();
     if (now - last_update > pdMS_TO_TICKS(500)) {
       last_update = now;
-      // Update status line
-      if (g_host_lines.size() > 2) {
-        g_host_lines.resize(3);
+      // Update status line (keep only header)
+      if (g_host_lines.size() > 1) {
+        g_host_lines.resize(1);
       }
       g_host_lines.push_back(uac_get_status_string());
       if (uac_is_streaming()) {
         g_host_lines.push_back("Decoding FT8...");
+        // Show debug lines with raw USB sample data
+        const char* dbg1 = uac_get_debug_line1();
+        const char* dbg2 = uac_get_debug_line2();
+        if (dbg1[0]) g_host_lines.push_back(dbg1);
+        if (dbg2[0]) g_host_lines.push_back(dbg2);
       }
       ui_draw_list(g_host_lines, 0, -1);
     }
