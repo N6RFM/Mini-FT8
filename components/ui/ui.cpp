@@ -10,7 +10,7 @@ static constexpr int SCREEN_H = 135;
 static constexpr int WATERFALL_H = 18;
 static constexpr int COUNTDOWN_H = 3;
 static constexpr int RX_LINES = 6;
-static bool ui_paused = false;
+static bool ui_paused = false;      // waterfall updates paused
 
 static uint8_t waterfall[WATERFALL_H][SCREEN_W];
 static int waterfall_head = 0;
@@ -52,7 +52,8 @@ bool ui_waterfall_dirty() { return waterfall_dirty; }
 void ui_draw_waterfall_if_dirty() { if (waterfall_dirty) ui_draw_waterfall(); }
 
 // Draw TX view: line 1 = next, lines 2-6 from queue/page
-void ui_draw_tx(const std::string& next, const std::vector<std::string>& queue, int page, int selected, const std::vector<bool>& mark_delete) {
+// slot_colors: optional per-line slot parity (0 even, 1 odd) for coloring text
+void ui_draw_tx(const std::string& next, const std::vector<std::string>& queue, int page, int selected, const std::vector<bool>& mark_delete, const std::vector<int>& slot_colors) {
     const int line_h = 19; // 16 text + 3 gap
     const int start_y = WATERFALL_H + COUNTDOWN_H + 3;
 
@@ -61,7 +62,11 @@ void ui_draw_tx(const std::string& next, const std::vector<std::string>& queue, 
     M5.Display.setTextSize(2);
     // Line 1: next (always)
     M5.Display.fillRect(0, start_y, SCREEN_W, line_h, TFT_BLACK);
-    M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+    uint16_t next_color = TFT_WHITE;
+    if (slot_colors.size() >= 1) {
+        next_color = (slot_colors[0] & 1) ? TFT_RED : TFT_GREEN;
+    }
+    M5.Display.setTextColor(next_color, TFT_BLACK);
     M5.Display.setCursor(0, start_y);
     M5.Display.printf("1 %s", next.c_str());
 
@@ -76,7 +81,11 @@ void ui_draw_tx(const std::string& next, const std::vector<std::string>& queue, 
             bool sel = (idx == selected);
             uint16_t bg = sel ? rgb565(30, 30, 60) : (del ? rgb565(60, 30, 30) : TFT_BLACK);
             M5.Display.fillRect(0, y, SCREEN_W, line_h, bg);
-            M5.Display.setTextColor(TFT_WHITE, bg);
+            uint16_t fg = TFT_WHITE;
+            if (slot_colors.size() > (size_t)(idx + 1)) {
+                fg = (slot_colors[idx + 1] & 1) ? TFT_RED : TFT_GREEN;
+            }
+            M5.Display.setTextColor(fg, bg);
             M5.Display.setCursor(0, y);
             M5.Display.printf("%d %s", i + 2, queue[idx].c_str());
         }
@@ -112,6 +121,15 @@ void ui_push_waterfall_row(const uint8_t* bins, int len) {
     waterfall_dirty = true;
 }
 
+void ui_clear_waterfall() {
+    for (int r = 0; r < WATERFALL_H; ++r) {
+        memset(waterfall[r], 0, SCREEN_W);
+    }
+    waterfall_head = 0;
+    waterfall_dirty = true;
+    ui_draw_waterfall();
+}
+
 void ui_draw_waterfall() {
     waterfall_dirty = false;
     if (ui_paused) return;
@@ -132,7 +150,6 @@ void ui_draw_waterfall() {
 }
 
 void ui_draw_countdown(float fraction, bool even_slot) {
-    if (ui_paused) return;
     if (fraction < 0.0f) fraction = 0.0f;
     if (fraction > 1.0f) fraction = 1.0f;
     int filled = (int)(fraction * SCREEN_W);

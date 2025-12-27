@@ -3,8 +3,14 @@
 #include <string>
 
 struct TxEntry {
-    std::string text;
-    bool mark_delete = false;
+    std::string dxcall;       // target call or "FreeText"
+    std::string field3;       // grid/report/RR73/73 or full FreeText message
+    std::string text;         // optional prebuilt text to send/display
+    int snr = 0;              // report value (unused for FreeText)
+    int offset_hz = 0;        // TX offset to use
+    int slot_id = 0;          // slot to transmit (0 even, 1 odd)
+    int repeat_counter = 0;   // remaining TXs (1 removes after send)
+    bool mark_delete = false; // UI delete flag
 };
 
 // Shared TX state
@@ -12,5 +18,7 @@ extern TxEntry tx_next;
 extern std::vector<TxEntry> tx_queue;  // max size 10
 
 void tx_init();
-void tx_enqueue(const std::string& msg);
+void tx_enqueue(const TxEntry& entry);
 void tx_commit_deletions();
+// Render text for UI; if for_queue is true, repeat counter is shown for normal entries.
+std::string tx_entry_display(const TxEntry& e, bool for_queue);
