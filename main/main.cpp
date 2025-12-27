@@ -332,6 +332,7 @@ static OffsetSrc g_offset_src = OffsetSrc::RANDOM;
 static RadioType g_radio = RadioType::NONE;
 static std::string g_ant = "EFHW";
 static std::string g_comment1 = "MiniFT8 /Radio /Ant";
+static bool g_rxtx_log = true;
 static int menu_page = 0;
 static int menu_edit_idx = -1;
 static std::string menu_edit_buf;
@@ -353,6 +354,12 @@ int64_t rtc_now_ms();
 static void update_countdown();
 static void menu_flash_tick();
 static void rx_flash_tick();
+#if ENABLE_BLE
+static uint8_t g_own_addr_type;
+#endif
+static void log_rxtx_line(char dir, int snr, int offset_hz, const std::string& text);
+
+static void log_rxtx_line(char dir, int snr, int offset_hz, const std::string& text);
 #if !MIC_PROBE_APP
 void log_heap(const char* tag) {
   size_t free_sz = heap_caps_get_free_size(MALLOC_CAP_8BIT);
@@ -363,9 +370,26 @@ void log_heap(const char* tag) {
 #else
 static inline void log_heap(const char*) {}
 #endif
-#if ENABLE_BLE
-static uint8_t g_own_addr_type;
-#endif
+
+static void log_rxtx_line(char dir, int snr, int offset_hz, const std::string& text) {
+  if (!g_rxtx_log) return;
+  time_t now = (time_t)(rtc_now_ms() / 1000);
+  struct tm t;
+  localtime_r(&now, &t);
+  char ts[32];
+  snprintf(ts, sizeof(ts), "%04d%02d%02d %02d%02d%02d",
+           t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
+           t.tm_hour, t.tm_min, t.tm_sec);
+  double freq_mhz = 0.001 * (double)g_bands[g_band_sel].freq;
+  FILE* f = fopen("/spiffs/RxTxLog.txt", "a");
+  if (!f) {
+    ESP_LOGW(TAG, "RxTxLog open failed");
+    return;
+  }
+  fprintf(f, "%c [%s][%.3f] %s %d %d\n",
+          dir, ts, freq_mhz, text.c_str(), snr, offset_hz);
+  fclose(f);
+}
 
 // Log redirection to soft UART (G1/G2)
 static vprintf_like_t s_prev_vprintf = nullptr;
@@ -845,6 +869,7 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
         }
         ui_lines.push_back(line);
         seen_idx[text_str] = (int)ui_lines.size() - 1;
+        log_rxtx_line('R', snr_q, (int)lrintf(freq_hz), text_str);
         decodedCount++;
         if (decodedCount >= 32) break; // safety cap
       }
@@ -965,7 +990,15 @@ static void draw_menu_view() {
   lines.push_back(std::string("C:") + head_trim(menu_edit_idx == 9 ? menu_edit_buf : expand_comment1(), 16));
   lines.push_back(std::string("Sleep:") + (M5.Power.isCharging() ? "press" : "USB?"));
   lines.push_back(battery_status_line());
-
+ 
+  // Page 2 content (index 12+)
+  lines.push_back(std::string("RxTxLog:") + (g_rxtx_log ? "ON" : "OFF"));
+  lines.push_back(""); // padding to reach page 2
+  lines.push_back(""); // padding
+  lines.push_back(""); // padding
+  lines.push_back(""); // padding
+  lines.push_back(""); // padding
+  
   int highlight_abs = -1;
   int64_t now = rtc_now_ms();
   if (menu_edit_idx >= 0) {
@@ -987,9 +1020,9 @@ static void draw_menu_view() {
     const int line_h = 19;
     const int start_y = 18 + 3 + 3; // WATERFALL_H + COUNTDOWN_H + gap
     int y = start_y + line_on_page * line_h + 3;
-    int level = (int)M5.Power.getBatteryLevel();
-    bool charging = M5.Power.isCharging();
-    draw_battery_icon(190, y, 24, 12, level, charging);
+    //int level = (int)M5.Power.getBatteryLevel();
+    //bool charging = M5.Power.isCharging();
+    //draw_battery_icon(190, y, 24, 12, level, charging);
   }
 }
 
@@ -1468,6 +1501,8 @@ static void load_station_data() {
       g_ant = trim_copy(line + 4);
     } else if (strncmp(line, "comment1=", 9) == 0) {
       g_comment1 = trim_copy(line + 9);
+    } else if (sscanf(line, "rxtx_log=%d", &val) == 1) {
+      g_rxtx_log = (val != 0);
     }
   }
   fclose(f);
@@ -1498,6 +1533,7 @@ static void save_station_data() {
   fprintf(f, "radio=%d\n", (int)g_radio);
   fprintf(f, "ant=%s\n", g_ant.c_str());
   fprintf(f, "comment1=%s\n", g_comment1.c_str());
+  fprintf(f, "rxtx_log=%d\n", g_rxtx_log ? 1 : 0);
   fclose(f);
 }
 
@@ -2011,11 +2047,11 @@ static void app_task_core0(void* /*param*/) {
               }
               break;
             }
-              if (c == ';') {
-                if (menu_page > 0) { menu_page--; draw_menu_view(); }
-              } else if (c == '.') {
-                if (menu_page < 1) { menu_page++; draw_menu_view(); }
-            } else if (menu_page == 0) {
+        if (c == ';') {
+          if (menu_page > 0) { menu_page--; draw_menu_view(); }
+        } else if (c == '.') {
+          if (menu_page < 2) { menu_page++; draw_menu_view(); }
+        } else if (menu_page == 0) {
               if (c == '1') {
                 g_cq_type = (CqType)(((int)g_cq_type + 1) % 6);
                 save_station_data();
@@ -2076,6 +2112,12 @@ static void app_task_core0(void* /*param*/) {
                     debug_log_line("Sleep skipped: not charging");
                     draw_menu_view();
                   }
+                }
+              } else if (menu_page == 2) {
+                if (c == '1') {
+                  g_rxtx_log = !g_rxtx_log;
+                  save_station_data();
+                  draw_menu_view();
                 }
               }
           }
