@@ -83,7 +83,7 @@ void tx_engine_tick(int64_t slot_idx, int slot_parity, int ms_to_boundary) {
     s_sched_parity = slot_parity;
     s_sched_ms_to_boundary = ms_to_boundary;
     if (s_pending_valid) return;
-    if (ms_to_boundary > 4000) return; // only schedule close to boundary
+    // Removed the <4s gating; schedule as soon as we know about a pending slot
 
     bool enforce_gap = (s_last_tx_parity != -1 && s_last_tx_parity != slot_parity &&
                         slot_idx == s_last_tx_slot_idx + 1);
@@ -92,6 +92,8 @@ void tx_engine_tick(int64_t slot_idx, int slot_parity, int ms_to_boundary) {
     if (tx_engine_pick_candidate(slot_parity, enforce_gap, cand)) {
         s_pending = cand;
         s_pending_valid = true;
+        ESP_LOGI("TXENG", "scheduled: dx=%s f3=%s slot=%d rep=%d", cand.dxcall.c_str(),
+                 cand.field3.c_str(), cand.slot_id, cand.repeat_counter);
     }
 }
 
@@ -157,8 +159,8 @@ static bool tx_engine_pick_candidate(int slot_parity, bool enforce_gap, TxEntry&
 
 bool tx_engine_fetch_pending(TxEntry& out) {
     if (!s_pending_valid) {
-        // Try to schedule now if within window using last tick data
-        if (s_sched_ms_to_boundary <= 4000 && s_sched_parity != -1) {
+        // Try to schedule now using last tick data
+        if (s_sched_parity != -1) {
             bool enforce_gap = (s_last_tx_parity != -1 && s_last_tx_parity != s_sched_parity &&
                                 s_sched_slot_idx == s_last_tx_slot_idx + 1);
             TxEntry cand;
@@ -171,5 +173,7 @@ bool tx_engine_fetch_pending(TxEntry& out) {
     if (!s_pending_valid) return false;
     out = s_pending;
     s_pending_valid = false; // fetched; will be removed/decremented on mark_sent
+    ESP_LOGI("TXENG", "fetch_pending: dx=%s f3=%s slot=%d rep=%d", out.dxcall.c_str(),
+             out.field3.c_str(), out.slot_id, out.repeat_counter);
     return true;
 }

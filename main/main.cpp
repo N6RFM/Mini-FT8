@@ -370,6 +370,15 @@ static void enqueue_tx_with_preference(const TxEntry& te, bool reply_to_me);
 static bool looks_like_grid(const std::string& s);
 static bool looks_like_report(const std::string& s, int& out);
 static std::string g_last_reply_text;
+static void debug_dump_tx_state(const char* where);
+static void schedule_tx_if_idle();
+static void maybe_load_next_from_queue();
+static void select_next_from_queue();
+static int tx_next_idx = -1;
+static int current_tx_parity = -1; // 0 even,1 odd, -1 unset
+static int64_t last_tx_slot_idx = -1000;
+static void schedule_tx_if_idle();
+static void maybe_load_next_from_queue();
 
 static void log_rxtx_line(char dir, int snr, int offset_hz, const std::string& text);
 #if !MIC_PROBE_APP
@@ -563,23 +572,34 @@ struct WAVHeader {
 }
 
 static void redraw_tx_view() {
-    if (tx_entry_is_empty(tx_next) && !tx_queue.empty()) {
-      tx_next = tx_queue.back(); // show newest queued as default next
-    }
-    std::vector<std::string> qtext;
+  if (tx_entry_is_empty(tx_next)) {
+    select_next_from_queue();
+  }
+  std::vector<std::string> qtext;
     std::vector<bool> marks;
     std::vector<int> slots;
-  qtext.reserve(tx_queue.size());
-  marks.reserve(tx_queue.size());
-  slots.reserve(tx_queue.size() + 1);
-  for (auto &e : tx_queue) {
+    qtext.reserve(tx_queue.size());
+    marks.reserve(tx_queue.size());
+    slots.reserve(tx_queue.size() + 1);
+  for (size_t i = 0; i < tx_queue.size(); ++i) {
+    const auto &e = tx_queue[i];
     qtext.push_back(tx_entry_display(e, true)); // queue lines show repeat counter for normal entries
     marks.push_back(e.mark_delete);
     slots.push_back(e.slot_id & 1);
   }
   slots.insert(slots.begin(), tx_next.slot_id & 1); // slot for next at index 0
-  ui_draw_tx(tx_entry_display(tx_next, false /*for_queue*/), qtext, tx_page, tx_selected_idx, marks, slots);
-}
+    std::string next_line;
+    if (tx_next.dxcall == "FreeText") {
+      next_line = !tx_next.text.empty() ? tx_next.text : tx_next.field3;
+    } else if (!tx_entry_is_empty(tx_next)) {
+      next_line = tx_next.dxcall + " " + g_call;
+      if (!tx_next.field3.empty()) {
+        next_line += " ";
+        next_line += tx_next.field3;
+      }
+    }
+    ui_draw_tx(next_line, qtext, tx_page, tx_selected_idx, marks, slots);
+  }
 
 static void draw_band_view() {
   std::vector<std::string> lines;
@@ -1112,11 +1132,11 @@ static void draw_menu_long_edit() {
   ui_draw_list(lines, 0, -1);
 }
 
-  static void log_tones(const uint8_t* tones, size_t n) {
-    std::string line;
-    for (size_t i = 0; i < n; ++i) {
-      char buf[4];
-      snprintf(buf, sizeof(buf), "%u", (unsigned)tones[i]);
+static void log_tones(const uint8_t* tones, size_t n) {
+  std::string line;
+  for (size_t i = 0; i < n; ++i) {
+    char buf[4];
+    snprintf(buf, sizeof(buf), "%u", (unsigned)tones[i]);
     line += buf;
     if ((i + 1) % 20 == 0 || i + 1 == n) {
       debug_log_line(line);
@@ -1187,56 +1207,181 @@ static bool looks_like_report(const std::string& s, int& out) {
   return true;
 }
 
+static void debug_dump_tx_state(const char* where) {
+  ESP_LOGI("TXENG", "%s tx_next: dx=%s f3=%s slot=%d rep=%d", where,
+           tx_next.dxcall.c_str(), tx_next.field3.c_str(), tx_next.slot_id, tx_next.repeat_counter);
+  int idx = 0;
+  for (const auto& e : tx_queue) {
+    ESP_LOGI("TXENG", "  q[%d]: dx=%s f3=%s slot=%d rep=%d del=%d", idx,
+             e.dxcall.c_str(), e.field3.c_str(), e.slot_id, e.repeat_counter, e.mark_delete ? 1 : 0);
+    idx++;
+  }
+}
+
+static void maybe_load_next_from_queue() {
+  if (tx_entry_is_empty(tx_next)) {
+    select_next_from_queue();
+  }
+}
+
+static void select_next_from_queue() {
+    tx_next_idx = -1;
+    if (tx_queue.empty()) {
+      tx_next = TxEntry{};
+      current_tx_parity = -1;
+      tx_task_running = false;
+      return;
+    }
+    auto pick_with_parity = [&](int parity) -> bool {
+      for (int i = (int)tx_queue.size() - 1; i >= 0; --i) {
+        if (tx_queue[i].mark_delete) continue;
+        if ((tx_queue[i].slot_id & 1) != parity) continue;
+        tx_next_idx = i;
+        tx_next = tx_queue[i];
+        current_tx_parity = parity;
+        return true;
+      }
+      return false;
+    };
+    bool picked = false;
+    if (current_tx_parity != -1) {
+      picked = pick_with_parity(current_tx_parity);
+    }
+    if (!picked) {
+      current_tx_parity = -1;
+      // pick any (last), then set parity
+      for (int i = (int)tx_queue.size() - 1; i >= 0; --i) {
+        if (tx_queue[i].mark_delete) continue;
+        tx_next_idx = i;
+        tx_next = tx_queue[i];
+        current_tx_parity = tx_next.slot_id & 1;
+        picked = true;
+        break;
+      }
+    }
+    if (!picked) {
+      tx_next = TxEntry{};
+      current_tx_parity = -1;
+    }
+  }
+
+struct TxTaskContext {
+  TxEntry e;
+  int delay_ms;
+  int queue_idx;
+};
+
+static void tx_send_task(void* param);
+
+static void schedule_tx_if_idle() {
+  if (tx_task_running) return;
+  maybe_load_next_from_queue();
+  if (tx_entry_is_empty(tx_next)) return;
+  int64_t now_ms = rtc_now_ms();
+  int target_parity = tx_next.slot_id & 1;
+  int64_t slot_idx = now_ms / 15000;
+  if ((now_ms % 15000) != 0) slot_idx += 1; // next boundary
+  // enforce one blank slot after last TX
+  if (slot_idx <= last_tx_slot_idx + 1) {
+    slot_idx = last_tx_slot_idx + 2;
+  }
+  // adjust to desired parity
+  while ((slot_idx & 1) != target_parity) {
+    slot_idx += 1;
+  }
+  int64_t delay_ms = slot_idx * 15000 - now_ms;
+  current_tx_parity = target_parity;
+  auto* ctx = new TxTaskContext{tx_next, (int)delay_ms, tx_next_idx};
+  tx_task_running = true;
+  xTaskCreatePinnedToCore(tx_send_task, "tx_sched", 4096, ctx, 5, nullptr, 0);
+}
+
 static void enqueue_tx_with_preference(const TxEntry& te, bool reply_to_me) {
   tx_enqueue(te);
   bool empty_next = tx_entry_is_empty(tx_next);
   if (empty_next) {
+    tx_next_idx = (int)tx_queue.size() - 1;
     tx_next = te;
   } else if (reply_to_me) {
     bool cur_rr = tx_entry_is_rr(tx_next);
     bool new_rr = tx_entry_is_rr(te);
     bool flip_slot = ((tx_next.slot_id ^ te.slot_id) & 1) != 0;
     if (!cur_rr || (cur_rr && new_rr && flip_slot)) {
+      tx_next_idx = (int)tx_queue.size() - 1;
       tx_next = te;
     }
   }
+  debug_dump_tx_state(reply_to_me ? "enqueue (reply)" : "enqueue");
   redraw_tx_view();
+  schedule_tx_if_idle();
 }
 
 static void tx_send_task(void* param) {
-    std::unique_ptr<TxEntry> e(reinterpret_cast<TxEntry*>(param));
+    std::unique_ptr<TxTaskContext> ctx(reinterpret_cast<TxTaskContext*>(param));
+    if (ctx->delay_ms > 0) vTaskDelay(pdMS_TO_TICKS(ctx->delay_ms));
+    TxEntry* e_ptr = &ctx->e;
+    // If the queued entry was deleted before send, abort.
+    if (ctx->queue_idx >= 0) {
+      bool valid = false;
+      if (ctx->queue_idx < (int)tx_queue.size()) {
+        const auto &qe = tx_queue[ctx->queue_idx];
+        if (!qe.mark_delete && qe.dxcall == e_ptr->dxcall && qe.field3 == e_ptr->field3 &&
+            qe.slot_id == e_ptr->slot_id && qe.offset_hz == e_ptr->offset_hz) {
+          valid = true;
+        }
+      }
+      if (!valid) {
+        tx_next = TxEntry{};
+        tx_next_idx = -1;
+        tx_task_running = false;
+        maybe_load_next_from_queue();
+        schedule_tx_if_idle();
+        vTaskDelete(NULL);
+        return;
+      }
+    }
     ftx_message_t msg;
-  ftx_message_rc_t rc = ftx_message_encode(&msg, NULL, e->text.c_str());
-  if (rc != FTX_MESSAGE_RC_OK) {
-    ESP_LOGE(TAG, "Encode failed for TX");
-    tx_task_running = false;
-    vTaskDelete(NULL);
-    return;
+    ftx_message_rc_t rc = ftx_message_encode(&msg, NULL, e_ptr->text.c_str());
+    if (rc != FTX_MESSAGE_RC_OK) {
+      ESP_LOGE(TAG, "Encode failed for TX");
+      tx_task_running = false;
+      vTaskDelete(NULL);
+      return;
   }
-  uint8_t tones[79] = {0};
-  ft8_encode(msg.payload, tones);
+    uint8_t tones[79] = {0};
+    ft8_encode(msg.payload, tones);
     for (int i = 0; i < 79; ++i) {
       ESP_LOGI("TXTONE", "%02d %u", i, (unsigned)tones[i]);
       fft_waterfall_tx_tone(tones[i]);
       vTaskDelay(pdMS_TO_TICKS(160));
     }
+    // record slot index for spacing
     int64_t slot_idx = rtc_now_ms() / 15000;
-    tx_engine_mark_sent(*e, slot_idx);
+    last_tx_slot_idx = slot_idx;
+    // decrement repeat_counter and recycle if needed
+    if (ctx->queue_idx >= 0 && ctx->queue_idx < (int)tx_queue.size()) {
+      auto &qe = tx_queue[ctx->queue_idx];
+      if (qe.dxcall == e_ptr->dxcall && qe.field3 == e_ptr->field3 &&
+          qe.slot_id == e_ptr->slot_id && qe.offset_hz == e_ptr->offset_hz) {
+        if (qe.repeat_counter > 0) qe.repeat_counter--;
+        if (qe.repeat_counter <= 0 || qe.mark_delete) {
+          tx_queue.erase(tx_queue.begin() + ctx->queue_idx);
+        }
+      } else if (qe.mark_delete) {
+        // already deleted; nothing to do
+      }
+    }
     tx_next = TxEntry{};
+    tx_next_idx = -1;
     redraw_tx_view();
     tx_task_running = false;
+    maybe_load_next_from_queue();
+    schedule_tx_if_idle();
     vTaskDelete(NULL);
   }
 
-static void start_tx_task(const TxEntry& e, int64_t /*slot_idx*/, int /*ms_to_boundary*/) {
-  if (tx_task_running) return;
-  auto* heap_entry = new TxEntry(e);
-  tx_task_running = true;
-  xTaskCreatePinnedToCore(tx_send_task, "tx_tones", 4096, heap_entry, 5, nullptr, 0);
-}
-
-// Map sequence steps (6,1,2,3,4,5) to FT8 messages
-static TxEntry make_tx_entry(int step, const std::string& dxcall, int rpt_snr, int slot_id, int offset_hz) {
+  // Map sequence steps (6,1,2,3,4,5) to FT8 messages
+  static TxEntry make_tx_entry(int step, const std::string& dxcall, int rpt_snr, int slot_id, int offset_hz) {
   TxEntry e{};
   e.dxcall = dxcall;
   e.offset_hz = offset_hz;
@@ -1289,11 +1434,11 @@ static TxEntry make_tx_entry(int step, const std::string& dxcall, int rpt_snr, i
   return e;
 }
 
-static void draw_menu_view() {
-  if (menu_long_edit) {
-    draw_menu_long_edit();
-    return;
-  }
+  static void draw_menu_view() {
+    if (menu_long_edit) {
+      draw_menu_long_edit();
+      return;
+    }
   std::vector<std::string> lines;
   lines.reserve(12);
 
@@ -2104,18 +2249,7 @@ static void app_task_core0(void* /*param*/) {
   menu_flash_tick();
   rx_flash_tick();
   // TX scheduling/check
-  int64_t now_ms = rtc_now_ms();
-  int64_t slot_idx = now_ms / 15000;
-  int64_t slot_ms = now_ms % 15000;
-  int ms_to_boundary = (int)(15000 - slot_ms);
-  tx_engine_tick(slot_idx, slot_idx & 1, ms_to_boundary);
-  if (ms_to_boundary <= 4000 && !tx_task_running) {
-    TxEntry pending;
-    if (tx_engine_fetch_pending(pending)) {
-      tx_next = pending;
-      start_tx_task(pending, slot_idx, ms_to_boundary);
-    }
-  }
+  schedule_tx_if_idle();
 
   // Toggle UAC decode with 'x': start if not streaming; otherwise toggle decode on/off.
   if (c == 'x' || c == 'X') {
@@ -2191,25 +2325,26 @@ static void app_task_core0(void* /*param*/) {
           break;
         }
         case UIMode::TX: {
-          int start_idx = tx_page * 5;
-          if (c == ';') {
-            if (tx_page > 0) { tx_page--; redraw_tx_view(); }
-          } else if (c == '.') {
-            if (start_idx + 5 < (int)tx_queue.size()) { tx_page++; redraw_tx_view(); }
-          } else if (c == '1') {
-            if (start_idx < (int)tx_queue.size()) { tx_next = tx_queue[start_idx]; redraw_tx_view(); }
-          } else if (c == 'e' || c == 'E') {
-            encode_and_log_tx_next();
-          } else if (c >= '2' && c <= '6') {
-            int line = c - '2'; // 0..4
-            int idx = start_idx + line;
-            if (idx >= 0 && idx < (int)tx_queue.size()) {
-              tx_queue[idx].mark_delete = !tx_queue[idx].mark_delete;
-              redraw_tx_view();
+            int start_idx = tx_page * 5;
+            if (c == ';') {
+              if (tx_page > 0) { tx_page--; redraw_tx_view(); }
+            } else if (c == '.') {
+              if (start_idx + 5 < (int)tx_queue.size()) { tx_page++; redraw_tx_view(); }
+            } else if (c == '1') {
+              // noop for now; TX engine handles selection automatically
+            } else if (c == 'e' || c == 'E') {
+              encode_and_log_tx_next();
+            } else if (c >= '2' && c <= '6') {
+              int line = c - '2'; // 0..4
+              int idx = start_idx + line;
+              if (idx >= 0 && idx < (int)tx_queue.size()) {
+                tx_queue[idx].mark_delete = !tx_queue[idx].mark_delete;
+                select_next_from_queue();
+                redraw_tx_view();
+              }
             }
+            break;
           }
-          break;
-        }
         case UIMode::BAND: {
           if (band_edit_idx >= 0) {
             if (c >= '0' && c <= '9') { band_edit_buffer.push_back(c); draw_band_view(); }
