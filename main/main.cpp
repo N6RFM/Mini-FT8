@@ -1363,8 +1363,8 @@ static void tx_send_task(void* param) {
       vTaskDelete(NULL);
       return;
   }
-  uint8_t tones[79] = {0};
-  ft8_encode(msg.payload, tones);
+    uint8_t tones[79] = {0};
+    ft8_encode(msg.payload, tones);
     int start_tone = ctx->skip_tones;
     if (start_tone >= 79) start_tone = 79;
     if (ctx->skip_tones > 0) {
@@ -1377,21 +1377,41 @@ static void tx_send_task(void* param) {
     }
     // record slot index for spacing
     last_tx_slot_idx = ctx->slot_idx;
-    // decrement repeat_counter and recycle if needed
-    if (ctx->queue_idx >= 0 && ctx->queue_idx < (int)tx_queue.size()) {
-      auto &qe = tx_queue[ctx->queue_idx];
+    int parity = current_tx_parity;
+    int prev_idx = ctx->queue_idx;
+    // decrement repeat_counter and remove if needed
+    if (prev_idx >= 0 && prev_idx < (int)tx_queue.size()) {
+      auto &qe = tx_queue[prev_idx];
       if (qe.dxcall == e_ptr->dxcall && qe.field3 == e_ptr->field3 &&
           qe.slot_id == e_ptr->slot_id && qe.offset_hz == e_ptr->offset_hz) {
         if (qe.repeat_counter > 0) qe.repeat_counter--;
         if (qe.repeat_counter <= 0 || qe.mark_delete) {
-          tx_queue.erase(tx_queue.begin() + ctx->queue_idx);
+          tx_queue.erase(tx_queue.begin() + prev_idx);
+          prev_idx = -1;
         }
-      } else if (qe.mark_delete) {
-        // already deleted; nothing to do
       }
     }
-    tx_next = TxEntry{};
+    // Round-robin: advance to next entry in same parity group if available
     tx_next_idx = -1;
+    if (!tx_queue.empty() && parity != -1) {
+      int n = (int)tx_queue.size();
+      int start = prev_idx >= 0 ? (prev_idx % n) : 0;
+      for (int step = 1; step <= n; ++step) {
+        int idx = (start + step) % n;
+        const auto &qe = tx_queue[idx];
+        if (qe.mark_delete) continue;
+        if ((qe.slot_id & 1) != parity) continue;
+        tx_next_idx = idx;
+        tx_next = qe;
+        current_tx_parity = parity;
+        break;
+      }
+    }
+    if (tx_next_idx == -1) {
+      tx_next = TxEntry{};
+      current_tx_parity = -1;
+      select_next_from_queue(); // will pick new parity if available
+    }
     redraw_tx_view();
     tx_task_running = false;
     maybe_load_next_from_queue();
@@ -2343,14 +2363,44 @@ static void app_task_core0(void* /*param*/) {
         }
           break;
         }
-        case UIMode::TX: {
+          case UIMode::TX: {
             int start_idx = tx_page * 5;
             if (c == ';') {
               if (tx_page > 0) { tx_page--; redraw_tx_view(); }
             } else if (c == '.') {
               if (start_idx + 5 < (int)tx_queue.size()) { tx_page++; redraw_tx_view(); }
             } else if (c == '1') {
-              // noop for now; TX engine handles selection automatically
+              if (!tx_queue.empty()) {
+                int parity = current_tx_parity;
+                if (parity == -1) {
+                  if (!tx_entry_is_empty(tx_next)) parity = tx_next.slot_id & 1;
+                  else parity = tx_queue.back().slot_id & 1;
+                }
+                // ensure we have a current index
+                if (tx_next_idx < 0 || tx_next_idx >= (int)tx_queue.size()) {
+                  select_next_from_queue();
+                } else {
+                  int found = -1;
+                  // search forward from next position
+                  for (int i = tx_next_idx + 1; i < (int)tx_queue.size(); ++i) {
+                    if (tx_queue[i].mark_delete) continue;
+                    if ((tx_queue[i].slot_id & 1) == parity) { found = i; break; }
+                  }
+                  // wrap to beginning if needed
+                  if (found == -1) {
+                    for (int i = 0; i <= tx_next_idx; ++i) {
+                      if (tx_queue[i].mark_delete) continue;
+                      if ((tx_queue[i].slot_id & 1) == parity) { found = i; break; }
+                    }
+                  }
+                  if (found != -1) {
+                    tx_next_idx = found;
+                    tx_next = tx_queue[found];
+                    redraw_tx_view();
+                    schedule_tx_if_idle();
+                  }
+                }
+              }
             } else if (c == 'e' || c == 'E') {
               encode_and_log_tx_next();
             } else if (c >= '2' && c <= '6') {
