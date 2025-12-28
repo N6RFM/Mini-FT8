@@ -377,6 +377,8 @@ static void select_next_from_queue();
 static int tx_next_idx = -1;
 static int current_tx_parity = -1; // 0 even,1 odd, -1 unset
 static int64_t last_tx_slot_idx = -1000;
+static bool g_sync_pending = false;
+static int g_sync_delta_ms = 0;
 static void schedule_tx_if_idle();
 static void maybe_load_next_from_queue();
 
@@ -788,11 +790,11 @@ static void update_countdown() {
   }
 }
 
-static void menu_flash_tick() {
-  if (menu_flash_idx < 0) return;
-  int64_t now = rtc_now_ms();
-  if (now >= menu_flash_deadline) {
-    menu_flash_idx = -1;
+  static void menu_flash_tick() {
+    if (menu_flash_idx < 0) return;
+    int64_t now = rtc_now_ms();
+    if (now >= menu_flash_deadline) {
+      menu_flash_idx = -1;
     if (ui_mode == UIMode::MENU && !menu_long_edit && menu_edit_idx < 0) {
       draw_menu_view();
     }
@@ -810,6 +812,8 @@ static void rx_flash_tick() {
     }
   }
 }
+
+static void apply_pending_sync() {}
 
 static void fft_waterfall_tx_tone(uint8_t tone) {
   // Map tone 0-7 to screen width and push a bright bin
@@ -941,12 +945,13 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
     if (toks.size() > 2) line.field3 = toks[2];
   };
 
-  std::vector<UiRxLine> ui_lines;
-  if (num_candidates > 0) {
-    int decodedCount = 0;
-    std::unordered_map<std::string, int> seen_idx; // text -> index in ui_lines
-    for (int i = 0; i < num_candidates; ++i) {
-      ftx_message_t message;
+    std::vector<UiRxLine> ui_lines;
+    std::vector<float> time_offsets;
+    if (num_candidates > 0) {
+      int decodedCount = 0;
+      std::unordered_map<std::string, int> seen_idx; // text -> index in ui_lines
+      for (int i = 0; i < num_candidates; ++i) {
+        ftx_message_t message;
       ftx_decode_status_t status;
       memset(&message, 0, sizeof(message));
       memset(&status, 0, sizeof(status));
@@ -1013,13 +1018,14 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
           continue;
         }
 
-        UiRxLine line;
-        line.text = text;
-        line.snr = snr_q;
-        line.offset_hz = (int)lrintf(freq_hz);
-        line.slot_id = slot_id;
-        fill_fields(line, line.text, rc == FTX_MESSAGE_RC_OK ? call_to : nullptr,
-                    rc == FTX_MESSAGE_RC_OK ? call_de : nullptr,
+          UiRxLine line;
+          line.text = text;
+          line.snr = snr_q;
+          line.offset_hz = (int)lrintf(freq_hz);
+          line.slot_id = slot_id;
+          time_offsets.push_back(time_s);
+          fill_fields(line, line.text, rc == FTX_MESSAGE_RC_OK ? call_to : nullptr,
+                      rc == FTX_MESSAGE_RC_OK ? call_de : nullptr,
                     rc == FTX_MESSAGE_RC_OK ? extra : nullptr);
         if (line.text.rfind("CQ ", 0) == 0 || line.text == "CQ") {
           line.is_cq = true;
@@ -1042,6 +1048,24 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
   } else {
     ESP_LOGW(TAG, "No candidates found");
   }
+
+  // Auto sync: if >3 decodes, use median time offset and apply immediately (bounded)
+    if (time_offsets.size() > 3) {
+      std::vector<float> tmp = time_offsets;
+      std::sort(tmp.begin(), tmp.end());
+      float median = tmp[tmp.size() / 2];
+      if (std::fabs(median) > 0.3f) {
+        int delta_ms = (int)lrintf(-median * 1000.0f);
+        if (delta_ms > 320) delta_ms = 320;
+        if (delta_ms < -320) delta_ms = -320;
+        rtc_ms_start -= delta_ms;
+        rtc_last_update -= delta_ms;
+        rtc_update_strings();
+        ESP_LOGI("SYNC", "Applied RTC sync: median=%.2fs delta=%dms", median, delta_ms);
+      } else {
+        ESP_LOGD("SYNC", "Median=%.2fs within threshold; no sync", median);
+      }
+    }
 
   // Sort into reply-to-me, CQ, other; preserve order within each group
   std::vector<UiRxLine> to_me;
@@ -2287,6 +2311,7 @@ static void app_task_core0(void* /*param*/) {
   update_countdown();
   menu_flash_tick();
   rx_flash_tick();
+  apply_pending_sync();
   // TX scheduling/check
   schedule_tx_if_idle();
 
