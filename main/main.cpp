@@ -242,6 +242,8 @@ static std::vector<BandItem> g_bands = {
     {"30m", 10136},   {"20m", 14074},  {"17m", 18100},  {"15m", 21074},
     {"12m", 24915},   {"10m", 28074},  {"6m", 50313},   {"2m", 144174},
 };
+static std::string g_active_band_text = "80 40 20 17 15 12 10";
+static std::vector<int> g_active_band_indices;
 static int band_page = 0;
 static int band_edit_idx = -1;       // absolute index into g_bands
 static std::string band_edit_buffer; // text while editing
@@ -343,7 +345,7 @@ static int menu_page = 0;
 static int menu_edit_idx = -1;
 static std::string menu_edit_buf;
 static bool menu_long_edit = false;
-static enum { LONG_NONE, LONG_FT, LONG_COMMENT } menu_long_kind = LONG_NONE;
+static enum { LONG_NONE, LONG_FT, LONG_COMMENT, LONG_ACTIVE } menu_long_kind = LONG_NONE;
 static std::string menu_long_buf;
 static std::string menu_long_backup;
 static int menu_flash_idx = -1;          // absolute index to flash highlight
@@ -370,6 +372,7 @@ static void enqueue_tx_with_preference(const TxEntry& te, bool reply_to_me);
 static bool looks_like_grid(const std::string& s);
 static bool looks_like_report(const std::string& s, int& out);
 static std::string g_last_reply_text;
+static void rebuild_active_bands();
 static void debug_dump_tx_state(const char* where);
 static void schedule_tx_if_idle();
 static void maybe_load_next_from_queue();
@@ -814,6 +817,68 @@ static void rx_flash_tick() {
 }
 
 static void apply_pending_sync() {}
+
+static int band_number_from_name(const std::string& name) {
+  int num = 0;
+  for (char c : name) {
+    if (c >= '0' && c <= '9') {
+      num = num * 10 + (c - '0');
+    } else {
+      break;
+    }
+  }
+  return num;
+}
+
+static void rebuild_active_bands() {
+  std::string cleaned = g_active_band_text;
+  for (char& c : cleaned) {
+    if (c == ',' || c == '/' || c == '\\' || c == ';') c = ' ';
+    if (c == 'm' || c == 'M') c = ' ';
+  }
+  std::istringstream iss(cleaned);
+  std::vector<int> bands;
+  int v;
+  while (iss >> v) {
+    if (v <= 0) continue;
+    // match to g_bands by number prefix
+    for (size_t i = 0; i < g_bands.size(); ++i) {
+      if (band_number_from_name(g_bands[i].name) == v) {
+        if (std::find(bands.begin(), bands.end(), (int)i) == bands.end()) {
+          bands.push_back((int)i);
+        }
+        break;
+      }
+    }
+  }
+  if (bands.empty()) {
+    bands.resize(g_bands.size());
+    for (size_t i = 0; i < g_bands.size(); ++i) bands[i] = (int)i;
+  }
+  g_active_band_indices = bands;
+  if (std::find(g_active_band_indices.begin(), g_active_band_indices.end(), g_band_sel) == g_active_band_indices.end()) {
+    g_band_sel = g_active_band_indices[0];
+  }
+  // normalize text
+  std::ostringstream oss;
+  for (size_t i = 0; i < g_active_band_indices.size(); ++i) {
+    if (i) oss << ' ';
+    oss << band_number_from_name(g_bands[g_active_band_indices[i]].name);
+  }
+  g_active_band_text = oss.str();
+}
+
+static void advance_active_band(int delta) {
+  if (g_active_band_indices.empty()) rebuild_active_bands();
+  if (g_active_band_indices.empty()) return;
+  int pos = 0;
+  for (size_t i = 0; i < g_active_band_indices.size(); ++i) {
+    if (g_active_band_indices[i] == g_band_sel) { pos = (int)i; break; }
+  }
+  int n = (int)g_active_band_indices.size();
+  pos = (pos + delta + n) % n;
+  g_band_sel = g_active_band_indices[pos];
+}
 
 static void fft_waterfall_tx_tone(uint8_t tone) {
   // Map tone 0-7 to screen width and push a bright bin
@@ -1516,20 +1581,24 @@ static void tx_send_task(void* param) {
   lines.push_back(std::string("Sleep:") + (M5.Power.isCharging() ? "press" : "USB?"));
 
   lines.push_back(std::string("Offset:") + offset_name(g_offset_src));
-  lines.push_back(""); // padding to reach page 2
+  if (menu_edit_idx == 7) {
+    lines.push_back(std::string("Cursor:") + menu_edit_buf);
+  } else {
+    lines.push_back(std::string("Cursor:") + std::to_string(g_offset_hz));
+  }
   lines.push_back(std::string("Radio:") + radio_name(g_radio));
   lines.push_back(std::string("Antenna:") + elide_right(menu_edit_idx == 8 ? menu_edit_buf : g_ant));
   lines.push_back(std::string("C:") + head_trim(menu_edit_idx == 9 ? menu_edit_buf : expand_comment1(), 16));
   lines.push_back(battery_status_line());
- 
+
   // Page 2 content (index 12+)
   lines.push_back(std::string("RxTxLog:") + (g_rxtx_log ? "ON" : "OFF"));
   lines.push_back(std::string("SkipTX1:") + (g_skip_tx1 ? "ON" : "OFF"));
+  lines.push_back(std::string("ActiveBand:") + head_trim(g_active_band_text, 16));
   lines.push_back(""); // padding
   lines.push_back(""); // padding
   lines.push_back(""); // padding
-  lines.push_back(""); // padding
-  
+
   int highlight_abs = -1;
   int64_t now = rtc_now_ms();
   if (menu_edit_idx >= 0) {
@@ -1563,8 +1632,10 @@ static void tx_send_task(void* param) {
 static void draw_status_view() {
   std::string lines[6];
   lines[0] = std::string("Beacon: ") + beacon_name(g_beacon);
-  lines[1] = "Offset: " + std::to_string(g_offset_hz);
-  lines[2] = std::string("Band: ") + g_bands[g_band_sel].name + " " + std::to_string(g_bands[g_band_sel].freq);
+  lines[1] = "";
+  lines[2] = std::string("Band: ") +
+             std::string(g_bands[g_band_sel].name) + " " +
+             std::to_string(g_bands[g_band_sel].freq);
   lines[3] = std::string("Tune: ") + (g_tune ? "ON" : "OFF");
   if (status_edit_idx == 4 && !status_edit_buffer.empty()) {
     lines[4] = std::string("Date: ") + highlight_pos(status_edit_buffer, status_cursor_pos);
@@ -2037,10 +2108,15 @@ static void load_station_data() {
       g_rxtx_log = (val != 0);
     } else if (sscanf(line, "skiptx1=%d", &val) == 1) {
       g_skip_tx1 = (val != 0);
+    } else if (sscanf(line, "active_band=%d", &val) == 1) { // legacy single value
+      g_active_band_text = std::to_string(val);
+    } else if (strncmp(line, "active_bands=", 13) == 0) {
+      g_active_band_text = trim_copy(line + 13);
     }
   }
   fclose(f);
   rtc_set_from_strings();
+  rebuild_active_bands();
 }
 
 static void save_station_data() {
@@ -2068,6 +2144,7 @@ static void save_station_data() {
   fprintf(f, "ant=%s\n", g_ant.c_str());
   fprintf(f, "comment1=%s\n", g_comment1.c_str());
   fprintf(f, "rxtx_log=%d\n", g_rxtx_log ? 1 : 0);
+  fprintf(f, "active_bands=%s\n", g_active_band_text.c_str());
   fclose(f);
 }
 
@@ -2361,6 +2438,31 @@ static void app_task_core0(void* /*param*/) {
       else if (c == 't' || c == 'T') { cancel_status_edit(); enter_mode(ui_mode == UIMode::TX ? UIMode::RX : UIMode::TX); switched = true; }
       else if (c == 'b' || c == 'B') { cancel_status_edit(); enter_mode(ui_mode == UIMode::BAND ? UIMode::RX : UIMode::BAND); switched = true; }
       else if (c == 'm' || c == 'M') { cancel_status_edit(); enter_mode(ui_mode == UIMode::MENU ? UIMode::RX : UIMode::MENU); switched = true; }
+      else if (c == 'n' || c == 'N') {
+        cancel_status_edit();
+        if (ui_mode == UIMode::MENU) {
+          enter_mode(UIMode::RX);
+        } else {
+          menu_page = 0;
+          enter_mode(UIMode::MENU);
+          if (menu_page < 2) menu_page++;  // one "." press
+          draw_menu_view();
+        }
+        switched = true;
+      }
+      else if (c == 'o' || c == 'O') {
+        cancel_status_edit();
+        if (ui_mode == UIMode::MENU) {
+          enter_mode(UIMode::RX);
+        } else {
+          menu_page = 0;
+          enter_mode(UIMode::MENU);
+          if (menu_page < 2) menu_page++;  // first "."
+          if (menu_page < 2) menu_page++;  // second "."
+          draw_menu_view();
+        }
+        switched = true;
+      }
       else if (c == 'h' || c == 'H') { cancel_status_edit(); set_log_to_soft_uart(true); enter_mode(ui_mode == UIMode::HOST ? UIMode::RX : UIMode::HOST); switched = true; }
       else if (c == 'c' || c == 'C') { cancel_status_edit(); set_log_to_soft_uart(false); enter_mode(ui_mode == UIMode::CONTROL ? UIMode::RX : UIMode::CONTROL); switched = true; }
       else if (c == 'd' || c == 'D') { cancel_status_edit(); enter_mode(ui_mode == UIMode::DEBUG ? UIMode::RX : UIMode::DEBUG); switched = true; }
@@ -2475,7 +2577,7 @@ static void app_task_core0(void* /*param*/) {
           if (c == '1') { g_beacon = (BeaconMode)(((int)g_beacon + 1) % 5); save_station_data(); draw_status_view(); }
           else if (c == '2') { status_edit_idx = 1; status_edit_buffer.clear(); draw_status_view(); }
           else if (c == '3') {
-            g_band_sel = (g_band_sel + 1) % g_bands.size();
+            advance_active_band(1);
             g_decode_enabled = false; // pause RX when changing band
             save_station_data();
             draw_status_view();
@@ -2568,6 +2670,9 @@ static void app_task_core0(void* /*param*/) {
                   if (g_cq_type == CqType::CQFREETEXT) g_cq_freetext = g_free_text;
                 } else if (menu_long_kind == LONG_COMMENT) {
                   g_comment1 = menu_long_buf;
+                } else if (menu_long_kind == LONG_ACTIVE) {
+                  g_active_band_text = menu_long_buf;
+                  rebuild_active_bands();
                 }
                 save_station_data();
                 menu_long_edit = false;
@@ -2600,7 +2705,9 @@ static void app_task_core0(void* /*param*/) {
                   else if (idx == 4) g_call = menu_edit_buf;
                   else if (idx == 5) g_grid = menu_edit_buf;
                 } else {
-                  if (idx == 2) g_ant = menu_edit_buf;
+                  if (idx == 1) {
+                    g_offset_hz = atoi(menu_edit_buf.c_str());
+                  } else if (idx == 2) g_ant = menu_edit_buf;
                   else if (idx == 3) g_comment1 = menu_edit_buf;
                 }
                 save_station_data();
@@ -2674,10 +2781,14 @@ static void app_task_core0(void* /*param*/) {
                     draw_menu_view();
                   }
               }
-          } else if (menu_page == 1) {
+            } else if (menu_page == 1) {
                 if (c == '1') {
                   g_offset_src = (OffsetSrc)(((int)g_offset_src + 1) % 3);
                   save_station_data();
+                  draw_menu_view();
+                } else if (c == '2') {
+                  menu_edit_idx = 6 + 1; // Cursor
+                  menu_edit_buf = std::to_string(g_offset_hz);
                   draw_menu_view();
                 } else if (c == '3') {
                   g_radio = (RadioType)(((int)g_radio + 1) % 4);
@@ -2694,17 +2805,23 @@ static void app_task_core0(void* /*param*/) {
                   menu_long_backup = g_comment1;
                   draw_menu_view();
                 }
-              } else if (menu_page == 2) {
-                if (c == '1') {
-                  g_rxtx_log = !g_rxtx_log;
-                  save_station_data();
-                  draw_menu_view();
-                } else if (c == '2') {
-                  g_skip_tx1 = !g_skip_tx1;
-                  save_station_data();
-                  draw_menu_view();
-                }
+            } else if (menu_page == 2) {
+              if (c == '1') {
+                g_rxtx_log = !g_rxtx_log;
+                save_station_data();
+                draw_menu_view();
+              } else if (c == '2') {
+                g_skip_tx1 = !g_skip_tx1;
+                save_station_data();
+                draw_menu_view();
+              } else if (c == '3') {
+                menu_long_edit = true;
+                menu_long_kind = LONG_ACTIVE;
+                menu_long_buf = g_active_band_text;
+                menu_long_backup = g_active_band_text;
+                draw_menu_view();
               }
+            }
           }
           break;
         }
