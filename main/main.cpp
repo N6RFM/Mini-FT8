@@ -1269,6 +1269,8 @@ struct TxTaskContext {
   TxEntry e;
   int delay_ms;
   int queue_idx;
+  int slot_idx;
+  int skip_tones;
 };
 
 static void tx_send_task(void* param);
@@ -1279,19 +1281,32 @@ static void schedule_tx_if_idle() {
   if (tx_entry_is_empty(tx_next)) return;
   int64_t now_ms = rtc_now_ms();
   int target_parity = tx_next.slot_id & 1;
-  int64_t slot_idx = now_ms / 15000;
-  if ((now_ms % 15000) != 0) slot_idx += 1; // next boundary
-  // enforce one blank slot after last TX
-  if (slot_idx <= last_tx_slot_idx + 1) {
-    slot_idx = last_tx_slot_idx + 2;
+  int64_t now_slot = now_ms / 15000;
+  int64_t slot_ms = now_ms % 15000;
+  int now_parity = (int)(now_slot & 1);
+  bool can_inline = (target_parity == now_parity) && (slot_ms < 4000) && (now_slot >= last_tx_slot_idx + 2);
+
+  int64_t slot_idx = now_slot;
+  int64_t delay_ms = 0;
+  int skip_tones = 0;
+  if (can_inline) {
+    // start in current slot, skip elapsed symbols
+    skip_tones = (int)(slot_ms / 160);
+    if (skip_tones >= 79) return; // nothing to send
+    delay_ms = 0;
+  } else {
+    if (slot_ms != 0) slot_idx += 1; // next boundary
+    if (slot_idx <= last_tx_slot_idx + 1) {
+      slot_idx = last_tx_slot_idx + 2; // enforce one blank slot after last TX
+    }
+    while ((slot_idx & 1) != target_parity) {
+      slot_idx += 1;
+    }
+    delay_ms = slot_idx * 15000 - now_ms;
   }
-  // adjust to desired parity
-  while ((slot_idx & 1) != target_parity) {
-    slot_idx += 1;
-  }
-  int64_t delay_ms = slot_idx * 15000 - now_ms;
+
   current_tx_parity = target_parity;
-  auto* ctx = new TxTaskContext{tx_next, (int)delay_ms, tx_next_idx};
+  auto* ctx = new TxTaskContext{tx_next, (int)delay_ms, tx_next_idx, (int)slot_idx, skip_tones};
   tx_task_running = true;
   xTaskCreatePinnedToCore(tx_send_task, "tx_sched", 4096, ctx, 5, nullptr, 0);
 }
@@ -1318,8 +1333,8 @@ static void enqueue_tx_with_preference(const TxEntry& te, bool reply_to_me) {
 
 static void tx_send_task(void* param) {
     std::unique_ptr<TxTaskContext> ctx(reinterpret_cast<TxTaskContext*>(param));
-    if (ctx->delay_ms > 0) vTaskDelay(pdMS_TO_TICKS(ctx->delay_ms));
-    TxEntry* e_ptr = &ctx->e;
+  if (ctx->delay_ms > 0) vTaskDelay(pdMS_TO_TICKS(ctx->delay_ms));
+  TxEntry* e_ptr = &ctx->e;
     // If the queued entry was deleted before send, abort.
     if (ctx->queue_idx >= 0) {
       bool valid = false;
@@ -1348,16 +1363,20 @@ static void tx_send_task(void* param) {
       vTaskDelete(NULL);
       return;
   }
-    uint8_t tones[79] = {0};
-    ft8_encode(msg.payload, tones);
-    for (int i = 0; i < 79; ++i) {
+  uint8_t tones[79] = {0};
+  ft8_encode(msg.payload, tones);
+    int start_tone = ctx->skip_tones;
+    if (start_tone >= 79) start_tone = 79;
+    if (ctx->skip_tones > 0) {
+      ESP_LOGI("TXTONE", "Skipping first %d tones due to late start", ctx->skip_tones);
+    }
+    for (int i = start_tone; i < 79; ++i) {
       ESP_LOGI("TXTONE", "%02d %u", i, (unsigned)tones[i]);
       fft_waterfall_tx_tone(tones[i]);
       vTaskDelay(pdMS_TO_TICKS(160));
     }
     // record slot index for spacing
-    int64_t slot_idx = rtc_now_ms() / 15000;
-    last_tx_slot_idx = slot_idx;
+    last_tx_slot_idx = ctx->slot_idx;
     // decrement repeat_counter and recycle if needed
     if (ctx->queue_idx >= 0 && ctx->queue_idx < (int)tx_queue.size()) {
       auto &qe = tx_queue[ctx->queue_idx];
