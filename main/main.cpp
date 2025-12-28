@@ -364,6 +364,12 @@ static void rx_flash_tick();
 static uint8_t g_own_addr_type;
 #endif
 static void log_rxtx_line(char dir, int snr, int offset_hz, const std::string& text);
+static bool tx_entry_is_empty(const TxEntry& e);
+static bool tx_entry_is_rr(const TxEntry& e);
+static void enqueue_tx_with_preference(const TxEntry& te, bool reply_to_me);
+static bool looks_like_grid(const std::string& s);
+static bool looks_like_report(const std::string& s, int& out);
+static std::string g_last_reply_text;
 
 static void log_rxtx_line(char dir, int snr, int offset_hz, const std::string& text);
 #if !MIC_PROBE_APP
@@ -557,9 +563,12 @@ struct WAVHeader {
 }
 
 static void redraw_tx_view() {
-  std::vector<std::string> qtext;
-  std::vector<bool> marks;
-  std::vector<int> slots;
+    if (tx_entry_is_empty(tx_next) && !tx_queue.empty()) {
+      tx_next = tx_queue.back(); // show newest queued as default next
+    }
+    std::vector<std::string> qtext;
+    std::vector<bool> marks;
+    std::vector<int> slots;
   qtext.reserve(tx_queue.size());
   marks.reserve(tx_queue.size());
   slots.reserve(tx_queue.size() + 1);
@@ -1032,6 +1041,37 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
       others.push_back(l);
     }
   }
+
+  // Auto-hint TX for reply-to-me (first one only; dedup by text)
+  if (!to_me.empty()) {
+    const UiRxLine& l = to_me.front();
+    if (g_last_reply_text != l.text) {
+      int step = 0;
+      int rpt = l.snr;
+      int parsed = 0;
+      std::string f3 = l.field3;
+      if (f3 == "RR73" || f3 == "73" || f3 == "RRR") {
+        step = 5;
+      } else if (!f3.empty() && (f3[0] == 'R' || f3[0] == 'r')) {
+        if (looks_like_report(f3.substr(1), parsed)) rpt = parsed;
+        step = 4; // send RR73
+      } else if (looks_like_grid(f3)) {
+        step = 2; // they sent grid -> send report
+      } else if (looks_like_report(f3, parsed)) {
+        rpt = parsed;
+        step = 3; // they sent report -> send Rreport
+      } else {
+        step = 3; // default to Rreport
+      }
+      std::string dx = !l.field2.empty() ? l.field2 : l.field1;
+      if (!dx.empty() && step > 0) {
+        TxEntry te = make_tx_entry(step, dx, rpt, l.slot_id ^ 1, l.offset_hz);
+        enqueue_tx_with_preference(te, true);
+        g_last_reply_text = l.text;
+      }
+    }
+  }
+
   std::vector<UiRxLine> merged;
   merged.reserve(to_me.size() + cqs.size() + others.size());
   merged.insert(merged.end(), to_me.begin(), to_me.end());
@@ -1072,11 +1112,11 @@ static void draw_menu_long_edit() {
   ui_draw_list(lines, 0, -1);
 }
 
-static void log_tones(const uint8_t* tones, size_t n) {
-  std::string line;
-  for (size_t i = 0; i < n; ++i) {
-    char buf[4];
-    snprintf(buf, sizeof(buf), "%u", (unsigned)tones[i]);
+  static void log_tones(const uint8_t* tones, size_t n) {
+    std::string line;
+    for (size_t i = 0; i < n; ++i) {
+      char buf[4];
+      snprintf(buf, sizeof(buf), "%u", (unsigned)tones[i]);
     line += buf;
     if ((i + 1) % 20 == 0 || i + 1 == n) {
       debug_log_line(line);
@@ -1086,8 +1126,8 @@ static void log_tones(const uint8_t* tones, size_t n) {
 }
 
 static void encode_and_log_tx_next() {
-  ftx_message_t msg;
-  std::string payload;
+    ftx_message_t msg;
+    std::string payload;
   if (!tx_next.text.empty()) {
     payload = tx_next.text;
   } else if (tx_next.dxcall == "FreeText") {
@@ -1114,12 +1154,58 @@ static void encode_and_log_tx_next() {
   uint8_t tones[79] = {0};
   ft8_encode(msg.payload, tones);
   debug_log_line(std::string("Tones for '") + payload + "'");
-  log_tones(tones, 79);
+    log_tones(tones, 79);
+}
+
+static bool tx_entry_is_empty(const TxEntry& e) {
+  return e.dxcall.empty() && e.field3.empty() && e.text.empty();
+}
+
+static bool tx_entry_is_rr(const TxEntry& e) {
+  return (e.field3 == "RR73" || e.field3 == "73" || e.field3 == "RRR");
+}
+
+static bool looks_like_grid(const std::string& s) {
+  if (s.size() != 4) return false;
+  return std::isalpha((unsigned char)s[0]) && std::isalpha((unsigned char)s[1]) &&
+         std::isdigit((unsigned char)s[2]) && std::isdigit((unsigned char)s[3]);
+}
+
+static bool looks_like_report(const std::string& s, int& out) {
+  if (s.empty()) return false;
+  int sign = 1;
+  size_t idx = 0;
+  if (s[0] == '-') { sign = -1; idx = 1; }
+  else if (s[0] == '+') { idx = 1; }
+  if (idx >= s.size()) return false;
+  int val = 0;
+  for (; idx < s.size(); ++idx) {
+    if (!std::isdigit((unsigned char)s[idx])) return false;
+    val = val * 10 + (s[idx] - '0');
+  }
+  out = sign * val;
+  return true;
+}
+
+static void enqueue_tx_with_preference(const TxEntry& te, bool reply_to_me) {
+  tx_enqueue(te);
+  bool empty_next = tx_entry_is_empty(tx_next);
+  if (empty_next) {
+    tx_next = te;
+  } else if (reply_to_me) {
+    bool cur_rr = tx_entry_is_rr(tx_next);
+    bool new_rr = tx_entry_is_rr(te);
+    bool flip_slot = ((tx_next.slot_id ^ te.slot_id) & 1) != 0;
+    if (!cur_rr || (cur_rr && new_rr && flip_slot)) {
+      tx_next = te;
+    }
+  }
+  redraw_tx_view();
 }
 
 static void tx_send_task(void* param) {
-  std::unique_ptr<TxEntry> e(reinterpret_cast<TxEntry*>(param));
-  ftx_message_t msg;
+    std::unique_ptr<TxEntry> e(reinterpret_cast<TxEntry*>(param));
+    ftx_message_t msg;
   ftx_message_rc_t rc = ftx_message_encode(&msg, NULL, e->text.c_str());
   if (rc != FTX_MESSAGE_RC_OK) {
     ESP_LOGE(TAG, "Encode failed for TX");
@@ -1129,14 +1215,18 @@ static void tx_send_task(void* param) {
   }
   uint8_t tones[79] = {0};
   ft8_encode(msg.payload, tones);
-  for (int i = 0; i < 79; ++i) {
-    ESP_LOGI("TXTONE", "%02d %u", i, (unsigned)tones[i]);
-    fft_waterfall_tx_tone(tones[i]);
-    vTaskDelay(pdMS_TO_TICKS(160));
+    for (int i = 0; i < 79; ++i) {
+      ESP_LOGI("TXTONE", "%02d %u", i, (unsigned)tones[i]);
+      fft_waterfall_tx_tone(tones[i]);
+      vTaskDelay(pdMS_TO_TICKS(160));
+    }
+    int64_t slot_idx = rtc_now_ms() / 15000;
+    tx_engine_mark_sent(*e, slot_idx);
+    tx_next = TxEntry{};
+    redraw_tx_view();
+    tx_task_running = false;
+    vTaskDelete(NULL);
   }
-  tx_task_running = false;
-  vTaskDelete(NULL);
-}
 
 static void start_tx_task(const TxEntry& e, int64_t /*slot_idx*/, int /*ms_to_boundary*/) {
   if (tx_task_running) return;
@@ -1891,6 +1981,7 @@ static void app_task_core0(void* /*param*/) {
   ui_set_rx_list(empty);
   ui_draw_rx();
   tx_init();
+  tx_engine_reset();
   ui_mode = UIMode::RX;
   load_station_data();
 
@@ -2012,7 +2103,19 @@ static void app_task_core0(void* /*param*/) {
   update_countdown();
   menu_flash_tick();
   rx_flash_tick();
-  // TX scheduling/check (temporarily disabled while stabilizing UAC)
+  // TX scheduling/check
+  int64_t now_ms = rtc_now_ms();
+  int64_t slot_idx = now_ms / 15000;
+  int64_t slot_ms = now_ms % 15000;
+  int ms_to_boundary = (int)(15000 - slot_ms);
+  tx_engine_tick(slot_idx, slot_idx & 1, ms_to_boundary);
+  if (ms_to_boundary <= 4000 && !tx_task_running) {
+    TxEntry pending;
+    if (tx_engine_fetch_pending(pending)) {
+      tx_next = pending;
+      start_tx_task(pending, slot_idx, ms_to_boundary);
+    }
+  }
 
   // Toggle UAC decode with 'x': start if not streaming; otherwise toggle decode on/off.
   if (c == 'x' || c == 'X') {
@@ -2072,17 +2175,17 @@ static void app_task_core0(void* /*param*/) {
     switch (ui_mode) {
       case UIMode::RX: {
         int sel = ui_handle_rx_key(c);
-        if (sel >= 0 && sel < (int)g_rx_lines.size()) {
-          std::string dx = !g_rx_lines[sel].field2.empty() ? g_rx_lines[sel].field2 : g_rx_lines[sel].field1;
-          if (!dx.empty()) {
-            int start_step = g_skip_tx1 ? 2 : 1;
-            TxEntry te = make_tx_entry(start_step, dx, g_rx_lines[sel].snr, g_rx_lines[sel].slot_id ^ 1, g_rx_lines[sel].offset_hz);
-            tx_enqueue(te);
-            // Start active call at TX6 (we initiated), rpt_snr unknown
-            active_calls_touch(dx, te.field3, g_rx_lines[sel].snr, -99, g_rx_lines[sel].offset_hz, g_rx_lines[sel].slot_id, 6, false);
-          }
-          rx_flash_idx = sel;
-          rx_flash_deadline = rtc_now_ms() + 500;
+          if (sel >= 0 && sel < (int)g_rx_lines.size()) {
+            std::string dx = !g_rx_lines[sel].field2.empty() ? g_rx_lines[sel].field2 : g_rx_lines[sel].field1;
+            if (!dx.empty()) {
+              int start_step = g_skip_tx1 ? 2 : 1;
+              TxEntry te = make_tx_entry(start_step, dx, g_rx_lines[sel].snr, g_rx_lines[sel].slot_id ^ 1, g_rx_lines[sel].offset_hz);
+              enqueue_tx_with_preference(te, false);
+              // Start active call at TX6 (we initiated), rpt_snr unknown
+              active_calls_touch(dx, te.field3, g_rx_lines[sel].snr, -99, g_rx_lines[sel].offset_hz, g_rx_lines[sel].slot_id, 6, false);
+            }
+            rx_flash_idx = sel;
+            rx_flash_deadline = rtc_now_ms() + 500;
           ui_draw_rx(rx_flash_idx);
         }
           break;
@@ -2312,8 +2415,7 @@ static void app_task_core0(void* /*param*/) {
                 e.slot_id = (int)((now_slot + 1) & 1); // next slot
                 e.repeat_counter = 1;
                 e.mark_delete = false;
-                tx_enqueue(e);
-                tx_next = e;
+                enqueue_tx_with_preference(e, false);
                 menu_flash_idx = 1; // absolute index of "Send FreeText"
                 menu_flash_deadline = rtc_now_ms() + 500;
                 draw_menu_view();
