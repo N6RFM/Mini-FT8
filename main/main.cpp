@@ -1632,7 +1632,11 @@ static void tx_send_task(void* param) {
 static void draw_status_view() {
   std::string lines[6];
   lines[0] = std::string("Beacon: ") + beacon_name(g_beacon);
-  lines[1] = "";
+  if (uac_is_streaming()) {
+    lines[1] = std::string("Sync to ") + radio_name(g_radio);
+  } else {
+    lines[1] = std::string("Connect to ") + radio_name(g_radio);
+  }
   lines[2] = std::string("Band: ") +
              std::string(g_bands[g_band_sel].name) + " " +
              std::to_string(g_bands[g_band_sel].freq);
@@ -2225,16 +2229,19 @@ static void enter_mode(UIMode new_mode) {
         debug_log_line("USB serial not ready");
       }
       break;
-    case UIMode::HOST:
-      // Start UAC audio streaming
-      g_uac_lines.clear();
-      g_uac_lines.push_back("USB Audio Host Mode");
-      if (uac_start()) {
-        g_uac_lines.push_back("Starting USB host...");
-        g_uac_lines.push_back("Connect 24-bit/48kHz");
-        g_uac_lines.push_back("stereo USB mic");
-      } else {
-        g_uac_lines.push_back("Failed to start UAC");
+  case UIMode::HOST:
+    // Start UAC audio streaming
+    g_uac_lines.clear();
+    g_uac_lines.push_back("USB Audio Host Mode");
+    if (uac_start()) {
+      g_decode_enabled = true;
+      ui_set_paused(false);
+      ui_clear_waterfall();
+      g_uac_lines.push_back("Starting USB host...");
+      g_uac_lines.push_back("Connect 24-bit/48kHz");
+      g_uac_lines.push_back("stereo USB mic");
+    } else {
+      g_uac_lines.push_back("Failed to start UAC");
         debug_log_line("UAC start failed");
       }
       ui_draw_list(g_uac_lines, 0, -1);
@@ -2392,29 +2399,20 @@ static void app_task_core0(void* /*param*/) {
   // TX scheduling/check
   schedule_tx_if_idle();
 
-  // Toggle UAC decode with 'x': start if not streaming; otherwise toggle decode on/off.
-  if (c == 'x' || c == 'X') {
+  static bool last_status_uac = false;
+  bool cur_uac = uac_is_streaming();
+  if (cur_uac && !last_status_uac) {
     set_log_to_soft_uart(true);
-    if (uac_is_streaming()) {
-      g_decode_enabled = !g_decode_enabled;
-      debug_log_line(g_decode_enabled ? "Decode resumed" : "Decode paused");
-      if (!g_decode_enabled) {
-        ui_set_paused(true);
-        ui_clear_waterfall();
-      } else {
-        ui_set_paused(false);
-      }
-    } else if (uac_start()) {
-      g_decode_enabled = true;
-      ui_set_paused(false);
-      debug_log_line("UAC start");
-      ui_clear_waterfall(); // immediate visual feedback
-    } else {
-      debug_log_line("UAC start failed");
-    }
-    last_key = c;
-    vTaskDelay(pdMS_TO_TICKS(10));
-    continue;
+  }
+  if (ui_mode == UIMode::STATUS && cur_uac != last_status_uac) {
+    draw_status_view();
+  }
+  last_status_uac = cur_uac;
+
+  // Ensure decode is enabled whenever streaming becomes active.
+  if (uac_is_streaming() && !g_decode_enabled) {
+    g_decode_enabled = true;
+    ui_set_paused(false);
   }
 
   if (g_rx_dirty && ui_mode == UIMode::RX) {
@@ -2575,13 +2573,41 @@ static void app_task_core0(void* /*param*/) {
         case UIMode::STATUS: {
         if (status_edit_idx == -1) {
           if (c == '1') { g_beacon = (BeaconMode)(((int)g_beacon + 1) % 5); save_station_data(); draw_status_view(); }
-          else if (c == '2') { status_edit_idx = 1; status_edit_buffer.clear(); draw_status_view(); }
+          else if (c == '2') {
+            status_edit_idx = 1;
+            draw_status_view();
+            if (!uac_is_streaming()) {
+              debug_log_line("Starting UAC host...");
+              if (!uac_start()) {
+                debug_log_line("UAC start failed");
+              } else {
+                set_log_to_soft_uart(true);
+                g_decode_enabled = true;
+                ui_set_paused(false);
+                ui_clear_waterfall();
+              }
+            } else {
+              int freq_hz = g_bands[g_band_sel].freq * 1000;
+              char cmd[32];
+              snprintf(cmd, sizeof(cmd), "FA%011d;", freq_hz);
+              bool ok = false;
+              if (cat_cdc_ready()) {
+                if (cat_cdc_send(reinterpret_cast<const uint8_t*>(cmd), strlen(cmd), 200) == ESP_OK) {
+                  ok = true;
+                }
+                const char* md = "MD2;";
+                cat_cdc_send(reinterpret_cast<const uint8_t*>(md), strlen(md), 200);
+              }
+              debug_log_line(ok ? "CAT sync sent" : "CAT not ready");
+            }
+            status_edit_idx = -1;
+            draw_status_view();
+          }
           else if (c == '3') {
             advance_active_band(1);
-            g_decode_enabled = false; // pause RX when changing band
             save_station_data();
             draw_status_view();
-            debug_log_line("Decode paused after band change");
+            debug_log_line("Band changed");
           }
               else if (c == '4') {
                 g_tune = !g_tune;
