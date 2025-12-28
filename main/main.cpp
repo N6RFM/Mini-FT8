@@ -35,6 +35,8 @@ extern "C" {
 #include "driver/usb_serial_jtag.h"
 #include "driver/uart.h"
 #include "driver/gpio.h"
+#include "esp_system.h"
+#include "esp_random.h"
 #include <cctype>
 #include <cstdlib>
 #include <ctime>
@@ -380,10 +382,12 @@ static void select_next_from_queue();
 static int tx_next_idx = -1;
 static int current_tx_parity = -1; // 0 even,1 odd, -1 unset
 static int64_t last_tx_slot_idx = -1000;
+static int64_t last_beacon_slot = -1000;
 static bool g_sync_pending = false;
 static int g_sync_delta_ms = 0;
 static void schedule_tx_if_idle();
 static void maybe_load_next_from_queue();
+static void maybe_enqueue_beacon();
 
 static void log_rxtx_line(char dir, int snr, int offset_hz, const std::string& text);
 #if !MIC_PROBE_APP
@@ -1354,6 +1358,39 @@ static void select_next_from_queue() {
     }
   }
 
+static void maybe_enqueue_beacon() {
+  if (g_beacon == BeaconMode::OFF) return;
+  if (!tx_entry_is_empty(tx_next)) return;
+  if (!tx_queue.empty()) return;
+
+  int64_t now_ms = rtc_now_ms();
+  int64_t now_slot = now_ms / 15000;
+  int parity = (int)(now_slot & 1);
+
+  int target_parity = 0;
+  bool allow = false;
+  switch (g_beacon) {
+    case BeaconMode::EVEN:   target_parity = 0; allow = (parity == 0); break;
+    case BeaconMode::ODD:    target_parity = 1; allow = (parity == 1); break;
+    case BeaconMode::EVEN2:  target_parity = 0; allow = (parity == 0) && (now_slot >= last_beacon_slot + 2); break;
+    case BeaconMode::ODD2:   target_parity = 1; allow = (parity == 1) && (now_slot >= last_beacon_slot + 2); break;
+    default: break;
+  }
+  if (!allow) return;
+  if (now_slot == last_beacon_slot) return;
+
+  TxEntry cq = make_tx_entry(6, g_call, 0, target_parity, g_offset_hz);
+  if (g_cq_type == CqType::CQFREETEXT) {
+    cq.text = g_free_text;
+    cq.field3 = g_free_text;
+    cq.dxcall = "FreeText";
+  }
+  cq.repeat_counter = 1;
+  enqueue_tx_with_preference(cq, false);
+  last_beacon_slot = now_slot;
+  debug_log_line("Beacon CQ queued");
+}
+
 struct TxTaskContext {
   TxEntry e;
   int delay_ms;
@@ -1366,6 +1403,7 @@ static void tx_send_task(void* param);
 
 static void schedule_tx_if_idle() {
   if (tx_task_running) return;
+  maybe_enqueue_beacon();
   maybe_load_next_from_queue();
   if (tx_entry_is_empty(tx_next)) return;
   int64_t now_ms = rtc_now_ms();
@@ -1424,6 +1462,7 @@ static void tx_send_task(void* param) {
     std::unique_ptr<TxTaskContext> ctx(reinterpret_cast<TxTaskContext*>(param));
   if (ctx->delay_ms > 0) vTaskDelay(pdMS_TO_TICKS(ctx->delay_ms));
   TxEntry* e_ptr = &ctx->e;
+
     // If the queued entry was deleted before send, abort.
     if (ctx->queue_idx >= 0) {
       bool valid = false;
@@ -1454,15 +1493,66 @@ static void tx_send_task(void* param) {
   }
     uint8_t tones[79] = {0};
     ft8_encode(msg.payload, tones);
+
+    // CAT: compute base TX audio offset
+    int base_hz = 0;
+    auto rand_off = []() {
+      uint32_t r = esp_random();
+      return 500 + (int)(r % 2001); // 500-2500
+    };
+    if (g_offset_src == OffsetSrc::CURSOR) {
+      base_hz = g_offset_hz;
+    } else if (g_offset_src == OffsetSrc::RX && e_ptr->offset_hz > 0 && e_ptr->text.rfind("CQ ", 0) != 0) {
+      base_hz = e_ptr->offset_hz;
+    } else {
+      base_hz = rand_off();
+    }
+
+    bool cat_ok = cat_cdc_ready();
+    if (cat_ok) {
+      const char* md = "MD6;";
+      const char* tx = "TX;";
+      cat_cdc_send(reinterpret_cast<const uint8_t*>(md), strlen(md), 200);
+      cat_cdc_send(reinterpret_cast<const uint8_t*>(tx), strlen(tx), 200);
+    }
+
     int start_tone = ctx->skip_tones;
     if (start_tone >= 79) start_tone = 79;
     if (ctx->skip_tones > 0) {
       ESP_LOGI("TXTONE", "Skipping first %d tones due to late start", ctx->skip_tones);
     }
+    int last_ta_int = -1;
+    int last_ta_frac = -1;
+    auto send_ta = [&](float tone_hz) {
+      int ta_int = (int)lrintf(tone_hz);
+      float frac = tone_hz - (float)ta_int;
+      int ta_frac = (int)lrintf(frac * 100.0f); // two decimals
+      if (ta_int == last_ta_int && ta_frac == last_ta_frac) return;
+      char ta[16];
+      snprintf(ta, sizeof(ta), "TA%04d.%02d;", ta_int, ta_frac);
+      cat_cdc_send(reinterpret_cast<const uint8_t*>(ta), strlen(ta), 50);
+      last_ta_int = ta_int;
+      last_ta_frac = ta_frac;
+    };
+
+    // Send first tone TA if CAT is ready
+    if (cat_ok && start_tone < 79) {
+      float tone_hz = base_hz + 6.25f * tones[start_tone];
+      send_ta(tone_hz);
+    }
+
     for (int i = start_tone; i < 79; ++i) {
       ESP_LOGI("TXTONE", "%02d %u", i, (unsigned)tones[i]);
       fft_waterfall_tx_tone(tones[i]);
+      if (cat_ok) {
+        float tone_hz = base_hz + 6.25f * tones[i];
+        send_ta(tone_hz);
+      }
       vTaskDelay(pdMS_TO_TICKS(160));
+    }
+    if (cat_ok) {
+      const char* rx = "RX;";
+      cat_cdc_send(reinterpret_cast<const uint8_t*>(rx), strlen(rx), 200);
     }
     // record slot index for spacing
     last_tx_slot_idx = ctx->slot_idx;
@@ -2599,7 +2689,7 @@ static void app_task_core0(void* /*param*/) {
                 if (cat_cdc_send(reinterpret_cast<const uint8_t*>(cmd), strlen(cmd), 200) == ESP_OK) {
                   ok = true;
                 }
-                const char* md = "MD2;";
+                const char* md = "MD6;";
                 cat_cdc_send(reinterpret_cast<const uint8_t*>(md), strlen(md), 200);
               }
               debug_log_line(ok ? "CAT sync sent" : "CAT not ready");
@@ -2611,17 +2701,34 @@ static void app_task_core0(void* /*param*/) {
             advance_active_band(1);
             save_station_data();
             draw_status_view();
-            debug_log_line("Band changed");
-          }
+              debug_log_line("Band changed");
+            }
               else if (c == '4') {
                 g_tune = !g_tune;
-                const char* cmd = g_cat_toggle_high ? "FA00007074000;" : "FA00014074000;";
-                g_cat_toggle_high = !g_cat_toggle_high;
                 if (cat_cdc_ready()) {
-                  esp_err_t rc = cat_cdc_send(reinterpret_cast<const uint8_t*>(cmd), strlen(cmd), 200);
-                  ESP_LOGI(TAG, "CAT send %s rc=%s", cmd, esp_err_to_name(rc));
+                  int freq_hz = g_bands[g_band_sel].freq * 1000;
+                  char cmd[32];
+                  snprintf(cmd, sizeof(cmd), "FA%011d;", freq_hz);
+                  cat_cdc_send(reinterpret_cast<const uint8_t*>(cmd), strlen(cmd), 200); // set VFO
+                  cat_cdc_send(reinterpret_cast<const uint8_t*>(cmd), strlen(cmd), 200); // confirm VFO
+                  const char* md = "MD6;";
+                  cat_cdc_send(reinterpret_cast<const uint8_t*>(md), strlen(md), 200);   // USB mode
+                  if (g_tune) {
+                const char* tx = "TX;";
+                cat_cdc_send(reinterpret_cast<const uint8_t*>(tx), strlen(tx), 200); // key down
+                // Use current cursor/random offset ~1500 Hz as tune tone
+                int tune_hz = (g_offset_src == OffsetSrc::CURSOR) ? g_offset_hz : 1500;
+                char ta[16];
+                snprintf(ta, sizeof(ta), "TA%04d.%02d;", tune_hz, 0);
+                cat_cdc_send(reinterpret_cast<const uint8_t*>(ta), strlen(ta), 200); // start tune carrier
+                debug_log_line("CAT tune: TX TA");
+                  } else {
+                    const char* rx = "RX;";
+                    cat_cdc_send(reinterpret_cast<const uint8_t*>(rx), strlen(rx), 200); // release
+                    debug_log_line("CAT tune: RX");
+                  }
                 } else {
-                  ESP_LOGW(TAG, "CAT not ready; skipped send %s", cmd);
+                  ESP_LOGW(TAG, "CAT not ready; tune skipped");
                 }
                 draw_status_view();
               }
