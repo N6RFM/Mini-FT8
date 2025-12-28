@@ -2399,15 +2399,19 @@ static void app_task_core0(void* /*param*/) {
   // TX scheduling/check
   schedule_tx_if_idle();
 
-  static bool last_status_uac = false;
-  bool cur_uac = uac_is_streaming();
-  if (cur_uac && !last_status_uac) {
+  static int last_status_uac = -1; // -1 forces a redraw on first entry
+  int cur_uac = uac_is_streaming() ? 1 : 0;
+  if (cur_uac && last_status_uac == 0) {
     set_log_to_soft_uart(true);
   }
   if (ui_mode == UIMode::STATUS && cur_uac != last_status_uac) {
     draw_status_view();
   }
-  last_status_uac = cur_uac;
+  if (ui_mode != UIMode::STATUS) {
+    last_status_uac = -1;
+  } else {
+    last_status_uac = cur_uac;
+  }
 
   // Ensure decode is enabled whenever streaming becomes active.
   if (uac_is_streaming() && !g_decode_enabled) {
