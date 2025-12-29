@@ -226,7 +226,7 @@ static int gap_cb(struct ble_gap_event *event, void *arg)
 #endif // ENABLE_BLE
 
 static const char* TAG = "FT8";
-enum class UIMode { RX, TX, BAND, MENU, HOST, CONTROL, DEBUG, LIST, STATUS };
+enum class UIMode { RX, TX, BAND, MENU, HOST, CONTROL, DEBUG, LIST, STATUS, QSO };
 static UIMode ui_mode = UIMode::RX;
 static int tx_page = 0;
 static int tx_selected_idx = -1;  // index into tx_queue (not including tx_next)
@@ -304,6 +304,11 @@ static std::vector<std::string> g_ctrl_lines = {
     "LIST/INFO/HELP",
     "EXIT to leave"
 };
+static std::vector<std::string> g_q_lines;
+static std::vector<std::string> g_q_files;
+static bool g_q_show_entries = false;
+static int q_page = 0;
+static std::string g_q_current_file;
 static std::string host_input;
 static const char* HOST_PROMPT = "MINIFT8> ";
 static bool usb_ready = false;
@@ -367,7 +372,6 @@ static void rx_flash_tick();
 #if ENABLE_BLE
 static uint8_t g_own_addr_type;
 #endif
-static void log_rxtx_line(char dir, int snr, int offset_hz, const std::string& text);
 static bool tx_entry_is_empty(const TxEntry& e);
 static bool tx_entry_is_rr(const TxEntry& e);
 static void enqueue_tx_with_preference(const TxEntry& te, bool reply_to_me);
@@ -388,8 +392,11 @@ static int g_sync_delta_ms = 0;
 static void schedule_tx_if_idle();
 static void maybe_load_next_from_queue();
 static void maybe_enqueue_beacon();
+static void qso_load_file_list();
+static void qso_load_entries(const std::string& path);
 
-static void log_rxtx_line(char dir, int snr, int offset_hz, const std::string& text);
+static void log_rxtx_line(char dir, int snr, int offset_hz, const std::string& text, int repeat_counter = -1);
+static void log_adif_entry(const std::string& dxcall, const std::string& dxgrid, int rst_sent, int rst_rcvd);
 #if !MIC_PROBE_APP
 void log_heap(const char* tag) {
   size_t free_sz = heap_caps_get_free_size(MALLOC_CAP_8BIT);
@@ -401,7 +408,7 @@ void log_heap(const char* tag) {
 static inline void log_heap(const char*) {}
 #endif
 
-static void log_rxtx_line(char dir, int snr, int offset_hz, const std::string& text) {
+static void log_rxtx_line(char dir, int snr, int offset_hz, const std::string& text, int repeat_counter) {
   if (!g_rxtx_log) return;
   time_t now = (time_t)(rtc_now_ms() / 1000);
   struct tm t;
@@ -416,8 +423,134 @@ static void log_rxtx_line(char dir, int snr, int offset_hz, const std::string& t
     ESP_LOGW(TAG, "RxTxLog open failed");
     return;
   }
-  fprintf(f, "%c [%s][%.3f] %s %d %d\n",
-          dir, ts, freq_mhz, text.c_str(), snr, offset_hz);
+  // For TX, omit SNR and repeat; for RX keep SNR.
+  if (dir == 'T') {
+    fprintf(f, "%c [%s][%.3f] %s %d\n",
+            dir, ts, freq_mhz, text.c_str(), offset_hz);
+  } else {
+    fprintf(f, "%c [%s][%.3f] %s %d %d\n",
+            dir, ts, freq_mhz, text.c_str(), snr, offset_hz);
+  }
+  fclose(f);
+}
+
+static void qso_load_file_list() {
+  g_q_files.clear();
+  g_q_lines.clear();
+  DIR* dir = opendir("/spiffs");
+  if (!dir) {
+    g_q_lines.push_back("No ADIF logs");
+    return;
+  }
+  struct dirent* ent;
+  while ((ent = readdir(dir)) != nullptr) {
+    const char* name = ent->d_name;
+    size_t len = strlen(name);
+    if (len >= 4 && strcasecmp(name + len - 4, ".adi") == 0) {
+      g_q_files.emplace_back(name);
+    }
+  }
+  closedir(dir);
+  std::sort(g_q_files.begin(), g_q_files.end(), std::greater<std::string>());
+  if (g_q_files.empty()) {
+    g_q_lines.push_back("No ADIF logs");
+    return;
+  }
+  for (size_t i = 0; i < g_q_files.size(); ++i) {
+    g_q_lines.push_back(g_q_files[i]);
+  }
+}
+
+static void qso_load_entries(const std::string& path) {
+  g_q_lines.clear();
+  std::string full = std::string("/spiffs/") + path;
+  FILE* f = fopen(full.c_str(), "r");
+  if (!f) {
+    g_q_lines.push_back("Open fail");
+    return;
+  }
+  char line[256];
+  while (fgets(line, sizeof(line), f)) {
+    std::string s(line);
+    if (s.find("<call:") == std::string::npos) continue;
+    auto get_field = [&](const std::string& tag)->std::string {
+      size_t p = s.find("<" + tag);
+      if (p == std::string::npos) return "";
+      size_t gt = s.find('>', p);
+      if (gt == std::string::npos) return "";
+      size_t end = s.find(' ', gt);
+      if (end == std::string::npos) end = s.size();
+      return s.substr(gt + 1, end - gt - 1);
+    };
+    std::string call = get_field("call:");
+    std::string time_on = get_field("time_on:");
+    std::string freq = get_field("freq:");
+    std::string band = freq;
+    if (!freq.empty()) {
+      // crude map: take MHz and map to band name from our band list
+      double mhz = atof(freq.c_str());
+      for (const auto& b : g_bands) {
+        double bm = b.freq * 0.001;
+        if (fabs(bm - mhz) < 0.1) { band = b.name; break; }
+      }
+    }
+    if (time_on.size() >= 4) {
+      time_on = time_on.substr(0,4);
+      time_on.insert(2, ":");
+    }
+    if (call.empty()) call = "?";
+    if (band.empty()) band = freq.empty() ? "?" : freq;
+    g_q_lines.push_back(time_on + " " + band + " " + call);
+  }
+  fclose(f);
+  if (g_q_lines.empty()) g_q_lines.push_back("No QSOs");
+}
+
+static void log_adif_entry(const std::string& dxcall, const std::string& dxgrid, int rst_sent, int rst_rcvd) {
+  // Build file name based on current date
+  time_t now = (time_t)(rtc_now_ms() / 1000);
+  struct tm t;
+  localtime_r(&now, &t);
+  char date[16];
+  int year = t.tm_year + 1900;
+  int month = t.tm_mon + 1;
+  int day = t.tm_mday;
+  snprintf(date, sizeof(date), "%04d%02d%02d", year % 10000, month % 100, day % 100);
+  char path[64];
+  snprintf(path, sizeof(path), "/spiffs/%s.adi", date);
+
+  bool need_header = false;
+  struct stat st;
+  if (stat(path, &st) != 0) need_header = true;
+
+  FILE* f = fopen(path, "a");
+  if (!f) {
+    ESP_LOGW(TAG, "ADIF open failed");
+    return;
+  }
+  if (need_header) {
+    fprintf(f, "ADIF EXPORT\n<eoh>\n");
+  }
+
+  char time_on[16];
+  int hour = t.tm_hour;
+  int min = t.tm_min;
+  int sec = t.tm_sec;
+  snprintf(time_on, sizeof(time_on), "%02d%02d%02d", hour % 100, min % 100, sec % 100);
+  double freq_mhz = 0.001 * (double)g_bands[g_band_sel].freq;
+  char freq_str[16];
+  snprintf(freq_str, sizeof(freq_str), "%.3f", freq_mhz);
+
+  fprintf(f, "<call:%zu>%s <gridsquare:%zu>%s <mode:3>FT8<qso_date:8>%s <time_on:6>%s <freq:%zu>%s <station_callsign:%zu>%s <my_gridsquare:%zu>%s <rst_sent:%d>%d <rst_rcvd:%d>%d <comment:%zu>%s <eor>\n",
+          dxcall.size(), dxcall.c_str(),
+          dxgrid.size(), dxgrid.c_str(),
+          date, time_on,
+          strlen(freq_str), freq_str,
+          g_call.size(), g_call.c_str(),
+          g_grid.size(), g_grid.c_str(),
+          rst_sent == -99 ? 1 : (int)snprintf(nullptr,0,"%d",rst_sent), rst_sent,
+          rst_rcvd == -99 ? 1 : (int)snprintf(nullptr,0,"%d",rst_rcvd), rst_rcvd,
+          g_comment1.size(), g_comment1.c_str());
   fclose(f);
 }
 
@@ -1106,7 +1239,7 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
         }
         ui_lines.push_back(line);
         seen_idx[text_str] = (int)ui_lines.size() - 1;
-        log_rxtx_line('R', snr_q, (int)lrintf(freq_hz), text_str);
+        log_rxtx_line('R', snr_q, (int)lrintf(freq_hz), text_str, -1);
         decodedCount++;
         if (decodedCount >= 32) break; // safety cap
       }
@@ -1176,11 +1309,56 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
       } else {
         step = 3; // default to Rreport
       }
+      // Active calls tracking
+      bool is_rr73 = (f3 == "RR73" || f3 == "RRR");
+      bool is_73 = (f3 == "73");
+      bool is_tx3 = false;
+      int tx3_rpt = -99;
+      if (!f3.empty() && (f3[0] == 'R' || f3[0] == 'r')) {
+        std::string rpt_only = f3.substr(1);
+        if (looks_like_report(rpt_only, parsed)) {
+          is_tx3 = true;
+          tx3_rpt = parsed;
+        }
+      }
+      int seq = 0;
+      if (looks_like_grid(f3)) seq = 1;
+      else if (looks_like_report(f3, parsed)) seq = 2;
+      else if (is_rr73) seq = 4;
+      else if (is_73) seq = 5;
+      ActiveCall* ac = active_calls_touch(!l.field2.empty() ? l.field2 : l.field1,
+                         l.field3, l.snr, rpt, l.offset_hz, l.slot_id, seq, is_rr73 || is_73);
+
       std::string dx = !l.field2.empty() ? l.field2 : l.field1;
       if (!dx.empty() && step > 0) {
         TxEntry te = make_tx_entry(step, dx, rpt, l.slot_id ^ 1, l.offset_hz);
         enqueue_tx_with_preference(te, true);
         g_last_reply_text = l.text;
+      }
+      if (is_tx3) {
+        int rst_sent = ac ? ac->rpt_snr : -99;
+        int rst_rcvd = (tx3_rpt != -99) ? tx3_rpt : (ac ? ac->rx_snr : -99);
+        log_adif_entry(dx, ac ? ac->dxgrid : l.field3, rst_sent, rst_rcvd);
+      }
+      // Signoff handling for inbound RR73/73
+      if (is_rr73) {
+        // They sent RR73 to us: enqueue our 73
+        TxEntry t73 = make_tx_entry(5, dx, rpt, l.slot_id ^ 1, l.offset_hz);
+        t73.repeat_counter = 1;
+        enqueue_tx_with_preference(t73, true);
+        int rst_sent = ac ? ac->rpt_snr : -99;
+        int rst_rcvd = (rpt != -99) ? rpt : (ac ? ac->rx_snr : -99);
+        log_adif_entry(dx, l.field3, rst_sent, rst_rcvd);
+      } else if (is_73) {
+        // They sent final 73: drop any pending RR and mark signoff
+        for (size_t qi = 0; qi < tx_queue.size(); ++qi) {
+          if (!tx_queue[qi].mark_delete && tx_queue[qi].dxcall == dx &&
+              tx_entry_is_rr(tx_queue[qi])) {
+            tx_queue.erase(tx_queue.begin() + qi);
+            break;
+          }
+        }
+        active_calls_touch(dx, l.field3, l.snr, rpt, l.offset_hz, l.slot_id, seq, true);
       }
     }
   }
@@ -1493,6 +1671,7 @@ static void tx_send_task(void* param) {
   }
     uint8_t tones[79] = {0};
     ft8_encode(msg.payload, tones);
+    log_rxtx_line('T', e_ptr->snr, e_ptr->offset_hz, e_ptr->text, e_ptr->repeat_counter);
 
     // CAT: compute base TX audio offset
     int base_hz = 0;
@@ -1614,8 +1793,8 @@ static void tx_send_task(void* param) {
       e.snr = rpt_snr;
       break;
     }
-    case 1: { // mycall dxcall grid
-      e.text = g_call + " " + dxcall + " " + g_grid;
+    case 1: { // dxcall mycall grid
+      e.text = dxcall + " " + g_call + " " + g_grid;
       e.field3 = g_grid;
       e.snr = rpt_snr;
       break;
@@ -1627,9 +1806,9 @@ static void tx_send_task(void* param) {
       e.snr = rpt_snr;
       break;
     }
-    case 3: { // mycall dxcall Rrpt
+    case 3: { // dxcall mycall Rrpt
       snprintf(buf, sizeof(buf), "%d", rpt_snr);
-      e.text = g_call + " " + dxcall + " R" + std::string(buf);
+      e.text = dxcall + " " + g_call + " R" + std::string(buf);
       e.field3 = std::string("R") + buf;
       e.snr = rpt_snr;
       break;
@@ -1640,8 +1819,8 @@ static void tx_send_task(void* param) {
       e.snr = rpt_snr;
       break;
     }
-    case 5: { // mycall dxcall 73
-      e.text = g_call + " " + dxcall + " 73";
+    case 5: { // dxcall mycall 73
+      e.text = dxcall + " " + g_call + " 73";
       e.field3 = "73";
       e.snr = rpt_snr;
       break;
@@ -2340,6 +2519,12 @@ static void enter_mode(UIMode new_mode) {
       list_page = 0;
       ui_draw_list(g_list_lines, list_page, -1);
       break;
+    case UIMode::QSO:
+      g_q_show_entries = false;
+      q_page = 0;
+      qso_load_file_list();
+      ui_draw_list(g_q_lines, q_page, -1);
+      break;
     case UIMode::STATUS:
       status_edit_idx = -1;
       status_cursor_pos = -1;
@@ -2555,6 +2740,7 @@ static void app_task_core0(void* /*param*/) {
         }
         switched = true;
       }
+      else if (c == 'q' || c == 'Q') { cancel_status_edit(); enter_mode(ui_mode == UIMode::QSO ? UIMode::RX : UIMode::QSO); switched = true; }
       else if (c == 'h' || c == 'H') { cancel_status_edit(); set_log_to_soft_uart(true); enter_mode(ui_mode == UIMode::HOST ? UIMode::RX : UIMode::HOST); switched = true; }
       else if (c == 'c' || c == 'C') { cancel_status_edit(); set_log_to_soft_uart(false); enter_mode(ui_mode == UIMode::CONTROL ? UIMode::RX : UIMode::CONTROL); switched = true; }
       else if (c == 'd' || c == 'D') { cancel_status_edit(); enter_mode(ui_mode == UIMode::DEBUG ? UIMode::RX : UIMode::DEBUG); switched = true; }
@@ -2795,173 +2981,42 @@ static void app_task_core0(void* /*param*/) {
           }
           break;
         }
-        case UIMode::CONTROL:
-          break;
-        case UIMode::HOST:
-        case UIMode::MENU: {
-          if (ui_mode == UIMode::MENU) {
-            if (menu_long_edit) {
-              if (c == '\n' || c == '\r') {
-                if (menu_long_kind == LONG_FT) {
-                  g_free_text = menu_long_buf;
-                  if (g_cq_type == CqType::CQFREETEXT) g_cq_freetext = g_free_text;
-                } else if (menu_long_kind == LONG_COMMENT) {
-                  g_comment1 = menu_long_buf;
-                } else if (menu_long_kind == LONG_ACTIVE) {
-                  g_active_band_text = menu_long_buf;
-                  rebuild_active_bands();
-                }
-                save_station_data();
-                menu_long_edit = false;
-                menu_long_kind = LONG_NONE;
-                menu_long_buf.clear();
-                menu_long_backup.clear();
-                draw_menu_view();
-              } else if (c == '`') {
-                menu_long_edit = false;
-                menu_long_kind = LONG_NONE;
-                menu_long_buf.clear();
-                menu_long_backup.clear();
-                draw_menu_view();
-              } else if (c == 0x08 || c == 0x7f) {
-                if (!menu_long_buf.empty()) menu_long_buf.pop_back();
-                draw_menu_view();
-              } else if (c >= 32 && c < 127) {
-                char ch = c;
-                if (menu_long_kind == LONG_FT) ch = toupper((unsigned char)ch);
-                menu_long_buf.push_back(ch);
-                draw_menu_view();
+        case UIMode::QSO: {
+          if (!g_q_show_entries) {
+            if (c == ';') {
+              if (q_page > 0) { q_page--; ui_draw_list(g_q_lines, q_page, -1); }
+            } else if (c == '.') {
+              if ((q_page + 1) * 6 < (int)g_q_lines.size()) { q_page++; ui_draw_list(g_q_lines, q_page, -1); }
+            } else if (c >= '1' && c <= '6') {
+              int idx = q_page * 6 + (c - '1');
+              if (idx >= 0 && idx < (int)g_q_files.size()) {
+                g_q_current_file = g_q_files[idx];
+                qso_load_entries(g_q_current_file);
+                g_q_show_entries = true;
+                q_page = 0;
+                ui_draw_list(g_q_lines, q_page, -1);
               }
-              break;
-            } else if (menu_edit_idx >= 0) {
-              if (c == '\n' || c == '\r') {
-                int idx = menu_edit_idx % 6;
-                int page = menu_edit_idx / 6;
-                if (page == 0) {
-                  if (idx == 3) { g_free_text = menu_edit_buf; if (g_cq_type == CqType::CQFREETEXT) g_cq_freetext = g_free_text; }
-                  else if (idx == 4) g_call = menu_edit_buf;
-                  else if (idx == 5) g_grid = menu_edit_buf;
-                } else {
-                  if (idx == 1) {
-                    g_offset_hz = atoi(menu_edit_buf.c_str());
-                  } else if (idx == 2) g_ant = menu_edit_buf;
-                  else if (idx == 3) g_comment1 = menu_edit_buf;
-                }
-                save_station_data();
-                menu_edit_idx = -1;
-                menu_edit_buf.clear();
-                draw_menu_view();
-              } else if (c == 0x08 || c == 0x7f) {
-                if (!menu_edit_buf.empty()) menu_edit_buf.pop_back();
-                draw_menu_view();
-              } else if (c == '`') {
-                menu_edit_idx = -1;
-                menu_edit_buf.clear();
-                draw_menu_view();
-              } else if (c >= 32 && c < 127) {
-                char ch = c;
-                if (menu_edit_idx % 6 == 3 || menu_edit_idx % 6 == 4 || menu_edit_idx % 6 == 5) {
-                  ch = toupper((unsigned char)ch);
-                }
-                menu_edit_buf.push_back(ch);
-                draw_menu_view();
-              }
-              break;
             }
-        if (c == ';') {
-          if (menu_page > 0) { menu_page--; draw_menu_view(); }
-        } else if (c == '.') {
-          if (menu_page < 2) { menu_page++; draw_menu_view(); }
-        } else if (menu_page == 0) {
-              if (c == '1') {
-                g_cq_type = (CqType)(((int)g_cq_type + 1) % 6);
-                save_station_data();
-                draw_menu_view();
-              } else if (c == '2') {
-                TxEntry e{};
-                e.dxcall = "FreeText";
-                e.field3 = g_free_text;
-                e.text = g_free_text;
-                e.snr = 0;
-                e.offset_hz = g_offset_hz;
-                int64_t now_slot = rtc_now_ms() / 15000;
-                e.slot_id = (int)((now_slot + 1) & 1); // next slot
-                e.repeat_counter = 1;
-                e.mark_delete = false;
-                enqueue_tx_with_preference(e, false);
-                menu_flash_idx = 1; // absolute index of "Send FreeText"
-                menu_flash_deadline = rtc_now_ms() + 500;
-                draw_menu_view();
-                debug_log_line(std::string("Queued: ") + g_free_text);
-              } else if (c == '3') {
-                menu_long_edit = true;
-                menu_long_kind = LONG_FT;
-                menu_long_buf = g_free_text;
-                menu_long_backup = g_free_text;
-                draw_menu_view();
-              } else if (c == '4') {
-                menu_edit_idx = 4;
-                menu_edit_buf = g_call;
-                draw_menu_view();
-              } else if (c == '5') {
-                menu_edit_idx = 5;
-                menu_edit_buf = g_grid;
-                draw_menu_view();
-              } else if (c == '6') {
-                  if (M5.Power.isCharging()) {
-                    ESP_LOGI(TAG, "Sleep button pressed while charging; entering deep sleep");
-                    M5.Display.sleep();
-                    vTaskDelay(pdMS_TO_TICKS(100));
-                    esp_deep_sleep_start();
-                  } else {
-                    debug_log_line("Sleep skipped: not charging");
-                    draw_menu_view();
-                  }
-              }
-            } else if (menu_page == 1) {
-                if (c == '1') {
-                  g_offset_src = (OffsetSrc)(((int)g_offset_src + 1) % 3);
-                  save_station_data();
-                  draw_menu_view();
-                } else if (c == '2') {
-                  menu_edit_idx = 6 + 1; // Cursor
-                  menu_edit_buf = std::to_string(g_offset_hz);
-                  draw_menu_view();
-                } else if (c == '3') {
-                  g_radio = (RadioType)(((int)g_radio + 1) % 4);
-                  save_station_data();
-                  draw_menu_view();
-                } else if (c == '4') {
-                  menu_edit_idx = 6 + 2;
-                  menu_edit_buf = g_ant;
-                  draw_menu_view();
-                } else if (c == '5') {
-                  menu_long_edit = true;
-                  menu_long_kind = LONG_COMMENT;
-                  menu_long_buf = g_comment1;
-                  menu_long_backup = g_comment1;
-                  draw_menu_view();
-                }
-            } else if (menu_page == 2) {
-              if (c == '1') {
-                g_rxtx_log = !g_rxtx_log;
-                save_station_data();
-                draw_menu_view();
-              } else if (c == '2') {
-                g_skip_tx1 = !g_skip_tx1;
-                save_station_data();
-                draw_menu_view();
-              } else if (c == '3') {
-                menu_long_edit = true;
-                menu_long_kind = LONG_ACTIVE;
-                menu_long_buf = g_active_band_text;
-                menu_long_backup = g_active_band_text;
-                draw_menu_view();
-              }
+          } else {
+            if (c == ';') {
+              if (q_page > 0) { q_page--; ui_draw_list(g_q_lines, q_page, -1); }
+            } else if (c == '.') {
+              if ((q_page + 1) * 6 < (int)g_q_lines.size()) { q_page++; ui_draw_list(g_q_lines, q_page, -1); }
+            } else if (c == '`') {
+              // back to file list
+              g_q_show_entries = false;
+              q_page = 0;
+              qso_load_file_list();
+              ui_draw_list(g_q_lines, q_page, -1);
             }
           }
           break;
         }
+        case UIMode::CONTROL:
+          break;
+        case UIMode::HOST:
+        case UIMode::MENU:
+          break;
       }
     }
 
