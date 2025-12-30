@@ -1333,7 +1333,19 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
       std::string dx = !l.field2.empty() ? l.field2 : l.field1;
       if (!dx.empty() && step > 0) {
         TxEntry te = make_tx_entry(step, dx, rpt, l.slot_id ^ 1, l.offset_hz);
+        // Replace current tx_next immediately and enqueue for tracking
+        tx_next = te;
+        tx_next_idx = -1;
+        // Remove any queued entries for this dxcall to avoid stale responses
+        for (auto it = tx_queue.begin(); it != tx_queue.end();) {
+          if (!it->mark_delete && it->dxcall == dx) {
+            it = tx_queue.erase(it);
+          } else {
+            ++it;
+          }
+        }
         enqueue_tx_with_preference(te, true);
+        schedule_tx_if_idle();
         g_last_reply_text = l.text;
       }
       if (is_tx3) {
