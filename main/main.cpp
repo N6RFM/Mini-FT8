@@ -3029,8 +3029,170 @@ static void app_task_core0(void* /*param*/) {
         case UIMode::CONTROL:
           break;
         case UIMode::HOST:
-        case UIMode::MENU:
+        case UIMode::MENU: {
+          if (ui_mode == UIMode::MENU) {
+            if (menu_long_edit) {
+              if (c == '\n' || c == '\r') {
+                if (menu_long_kind == LONG_FT) {
+                  g_free_text = menu_long_buf;
+                  if (g_cq_type == CqType::CQFREETEXT) g_cq_freetext = g_free_text;
+                } else if (menu_long_kind == LONG_COMMENT) {
+                  g_comment1 = menu_long_buf;
+                } else if (menu_long_kind == LONG_ACTIVE) {
+                  g_active_band_text = menu_long_buf;
+                  rebuild_active_bands();
+                }
+                save_station_data();
+                menu_long_edit = false;
+                menu_long_kind = LONG_NONE;
+                menu_long_buf.clear();
+                menu_long_backup.clear();
+                draw_menu_view();
+              } else if (c == '`') {
+                menu_long_edit = false;
+                menu_long_kind = LONG_NONE;
+                menu_long_buf.clear();
+                menu_long_backup.clear();
+                draw_menu_view();
+              } else if (c == 0x08 || c == 0x7f) {
+                if (!menu_long_buf.empty()) menu_long_buf.pop_back();
+                draw_menu_view();
+              } else if (c >= 32 && c < 127) {
+                char ch = c;
+                if (menu_long_kind == LONG_FT) ch = toupper((unsigned char)ch);
+                menu_long_buf.push_back(ch);
+                draw_menu_view();
+              }
+              break;
+            } else if (menu_edit_idx >= 0) {
+              if (c == '\n' || c == '\r') {
+                int idx = menu_edit_idx % 6;
+                int page = menu_edit_idx / 6;
+                if (page == 0) {
+                  if (idx == 3) { g_free_text = menu_edit_buf; if (g_cq_type == CqType::CQFREETEXT) g_cq_freetext = g_free_text; }
+                  else if (idx == 4) g_call = menu_edit_buf;
+                  else if (idx == 5) g_grid = menu_edit_buf;
+                } else {
+                  if (idx == 1) {
+                    g_offset_hz = atoi(menu_edit_buf.c_str());
+                  } else if (idx == 2) g_ant = menu_edit_buf;
+                  else if (idx == 3) g_comment1 = menu_edit_buf;
+                }
+                save_station_data();
+                menu_edit_idx = -1;
+                menu_edit_buf.clear();
+                draw_menu_view();
+              } else if (c == 0x08 || c == 0x7f) {
+                if (!menu_edit_buf.empty()) menu_edit_buf.pop_back();
+                draw_menu_view();
+              } else if (c == '`') {
+                menu_edit_idx = -1;
+                menu_edit_buf.clear();
+                draw_menu_view();
+              } else if (c >= 32 && c < 127) {
+                char ch = c;
+                if (menu_edit_idx % 6 == 3 || menu_edit_idx % 6 == 4 || menu_edit_idx % 6 == 5) {
+                  ch = toupper((unsigned char)ch);
+                }
+                menu_edit_buf.push_back(ch);
+                draw_menu_view();
+              }
+              break;
+            }
+        if (c == ';') {
+          if (menu_page > 0) { menu_page--; draw_menu_view(); }
+        } else if (c == '.') {
+          if (menu_page < 2) { menu_page++; draw_menu_view(); }
+        } else if (menu_page == 0) {
+              if (c == '1') {
+                g_cq_type = (CqType)(((int)g_cq_type + 1) % 6);
+                save_station_data();
+                draw_menu_view();
+              } else if (c == '2') {
+                TxEntry e{};
+                e.dxcall = "FreeText";
+                e.field3 = g_free_text;
+                e.text = g_free_text;
+                e.snr = 0;
+                e.offset_hz = g_offset_hz;
+                int64_t now_slot = rtc_now_ms() / 15000;
+                e.slot_id = (int)((now_slot + 1) & 1); // next slot
+                e.repeat_counter = 1;
+                e.mark_delete = false;
+                enqueue_tx_with_preference(e, false);
+                menu_flash_idx = 1; // absolute index of "Send FreeText"
+                menu_flash_deadline = rtc_now_ms() + 500;
+                draw_menu_view();
+                debug_log_line(std::string("Queued: ") + g_free_text);
+              } else if (c == '3') {
+                menu_long_edit = true;
+                menu_long_kind = LONG_FT;
+                menu_long_buf = g_free_text;
+                menu_long_backup = g_free_text;
+                draw_menu_view();
+              } else if (c == '4') {
+                menu_edit_idx = 4;
+                menu_edit_buf = g_call;
+                draw_menu_view();
+              } else if (c == '5') {
+                menu_edit_idx = 5;
+                menu_edit_buf = g_grid;
+                draw_menu_view();
+              } else if (c == '6') {
+                  if (M5.Power.isCharging()) {
+                    ESP_LOGI(TAG, "Sleep button pressed while charging; entering deep sleep");
+                    M5.Display.sleep();
+                    vTaskDelay(pdMS_TO_TICKS(100));
+                    esp_deep_sleep_start();
+                  } else {
+                    debug_log_line("Sleep skipped: not charging");
+                    draw_menu_view();
+                  }
+              }
+            } else if (menu_page == 1) {
+                if (c == '1') {
+                  g_offset_src = (OffsetSrc)(((int)g_offset_src + 1) % 3);
+                  save_station_data();
+                  draw_menu_view();
+                } else if (c == '2') {
+                  menu_edit_idx = 6 + 1; // Cursor
+                  menu_edit_buf = std::to_string(g_offset_hz);
+                  draw_menu_view();
+                } else if (c == '3') {
+                  g_radio = (RadioType)(((int)g_radio + 1) % 4);
+                  save_station_data();
+                  draw_menu_view();
+                } else if (c == '4') {
+                  menu_edit_idx = 6 + 2;
+                  menu_edit_buf = g_ant;
+                  draw_menu_view();
+                } else if (c == '5') {
+                  menu_long_edit = true;
+                  menu_long_kind = LONG_COMMENT;
+                  menu_long_buf = g_comment1;
+                  menu_long_backup = g_comment1;
+                  draw_menu_view();
+                }
+            } else if (menu_page == 2) {
+              if (c == '1') {
+                g_rxtx_log = !g_rxtx_log;
+                save_station_data();
+                draw_menu_view();
+              } else if (c == '2') {
+                g_skip_tx1 = !g_skip_tx1;
+                save_station_data();
+                draw_menu_view();
+              } else if (c == '3') {
+                menu_long_edit = true;
+                menu_long_kind = LONG_ACTIVE;
+                menu_long_buf = g_active_band_text;
+                menu_long_backup = g_active_band_text;
+                draw_menu_view();
+              }
+            }
+          }
           break;
+        }
       }
     }
 
