@@ -253,6 +253,7 @@ static BeaconMode g_beacon = BeaconMode::OFF;
 static int g_offset_hz = 1500;
 static int g_band_sel = 1; // default 80m
 static bool g_tune = false;
+static BeaconMode g_status_beacon_temp = BeaconMode::OFF;
 static bool g_cat_toggle_high = false;
 static std::string g_date = "2025-12-11";
 static std::string g_time = "10:10:00";
@@ -732,7 +733,9 @@ static void redraw_tx_view() {
   }
   slots.insert(slots.begin(), tx_next.slot_id & 1); // slot for next at index 0
     std::string next_line;
-    if (tx_next.dxcall == "FreeText") {
+    if (!tx_next.text.empty()) {
+      next_line = tx_next.text;
+    } else if (tx_next.dxcall == "FreeText") {
       next_line = !tx_next.text.empty() ? tx_next.text : tx_next.field3;
     } else if (!tx_entry_is_empty(tx_next)) {
       next_line = tx_next.dxcall + " " + g_call;
@@ -1550,8 +1553,15 @@ static void select_next_from_queue() {
 
 static void maybe_enqueue_beacon() {
   if (g_beacon == BeaconMode::OFF) return;
-  if (!tx_entry_is_empty(tx_next)) return;
   if (!tx_queue.empty()) return;
+  // If tx_next is already a beacon, allow replacement so each eligible slot injects anew.
+  if (!tx_entry_is_empty(tx_next)) {
+    bool is_beacon = (tx_next.dxcall == g_call && tx_next.text.rfind("CQ ", 0) == 0) ||
+                     (tx_next.dxcall == "FreeText");
+    if (!is_beacon) return;
+    tx_next = TxEntry{};
+    tx_next_idx = -1;
+  }
 
   int64_t now_ms = rtc_now_ms();
   int64_t now_slot = now_ms / 15000;
@@ -1576,7 +1586,9 @@ static void maybe_enqueue_beacon() {
     cq.dxcall = "FreeText";
   }
   cq.repeat_counter = 1;
-  enqueue_tx_with_preference(cq, false);
+  // Beacon does not occupy the queue; load directly as next TX
+  tx_next = cq;
+  tx_next_idx = -1;
   last_beacon_slot = now_slot;
   debug_log_line("Beacon CQ queued");
 }
@@ -1665,7 +1677,11 @@ static void enqueue_tx_with_preference(const TxEntry& te, bool reply_to_me) {
 static void tx_send_task(void* param) {
     std::unique_ptr<TxTaskContext> ctx(reinterpret_cast<TxTaskContext*>(param));
   if (ctx->delay_ms > 0) vTaskDelay(pdMS_TO_TICKS(ctx->delay_ms));
+  // Use the latest tx_next if present to avoid sending stale payloads.
   TxEntry* e_ptr = &ctx->e;
+  if (!tx_entry_is_empty(tx_next)) {
+    *e_ptr = tx_next;
+  }
 
     // If the queued entry was deleted before send, abort.
     if (ctx->queue_idx >= 0) {
@@ -1804,7 +1820,7 @@ static void tx_send_task(void* param) {
   }
 
   // Map sequence steps (6,1,2,3,4,5) to FT8 messages
-  static TxEntry make_tx_entry(int step, const std::string& dxcall, int rpt_snr, int slot_id, int offset_hz) {
+static TxEntry make_tx_entry(int step, const std::string& dxcall, int rpt_snr, int slot_id, int offset_hz) {
   TxEntry e{};
   e.dxcall = dxcall;
   e.offset_hz = offset_hz;
@@ -1814,7 +1830,24 @@ static void tx_send_task(void* param) {
   char buf[16];
   switch (step) {
     case 6: { // CQ mycall grid
-      e.text = std::string("CQ ") + g_call + " " + g_grid;
+      std::string prefix = "CQ";
+      switch (g_cq_type) {
+        case CqType::CQSOTA: prefix = "CQ SOTA"; break;
+        case CqType::CQPOTA: prefix = "CQ POTA"; break;
+        case CqType::CQQRP:  prefix = "CQ QRP";  break;
+        case CqType::CQFD:   prefix = "CQ FD";   break;
+        case CqType::CQFREETEXT:
+          e.text = g_cq_freetext;
+          e.field3 = g_cq_freetext;
+          e.dxcall = "FreeText";
+          e.snr = rpt_snr;
+          break;
+        default: break;
+      }
+      if (e.text.empty()) {
+        e.text = prefix + " " + g_call + " " + g_grid;
+        e.field3 = g_grid;
+      }
       e.field3 = g_grid;
       e.snr = rpt_snr;
       break;
@@ -1926,7 +1959,8 @@ static void tx_send_task(void* param) {
 
 static void draw_status_view() {
   std::string lines[6];
-  lines[0] = std::string("Beacon: ") + beacon_name(g_beacon);
+  BeaconMode disp_beacon = (ui_mode == UIMode::STATUS) ? g_status_beacon_temp : g_beacon;
+  lines[0] = std::string("Beacon: ") + beacon_name(disp_beacon);
   if (uac_is_streaming()) {
     lines[1] = std::string("Sync to ") + radio_name(g_radio);
   } else {
@@ -2482,6 +2516,15 @@ static void enter_mode(UIMode new_mode) {
     tx_commit_deletions();
   }
   if (ui_mode == UIMode::STATUS && new_mode != UIMode::STATUS) {
+    if (g_beacon != g_status_beacon_temp) {
+      g_beacon = g_status_beacon_temp;
+      save_station_data();
+      if (g_beacon == BeaconMode::OFF) {
+        // Abort any pending beacon TX and clear next
+        tx_next = TxEntry{};
+        tx_next_idx = -1;
+      }
+    }
     status_edit_idx = -1;
     status_edit_buffer.clear();
   }
@@ -2552,6 +2595,7 @@ static void enter_mode(UIMode new_mode) {
       ui_draw_list(g_q_lines, q_page, -1);
       break;
     case UIMode::STATUS:
+      g_status_beacon_temp = g_beacon;
       status_edit_idx = -1;
       status_cursor_pos = -1;
       draw_status_view();
@@ -2878,7 +2922,7 @@ static void app_task_core0(void* /*param*/) {
         }
         case UIMode::STATUS: {
         if (status_edit_idx == -1) {
-          if (c == '1') { g_beacon = (BeaconMode)(((int)g_beacon + 1) % 5); save_station_data(); draw_status_view(); }
+          if (c == '1') { g_status_beacon_temp = (BeaconMode)(((int)g_status_beacon_temp + 1) % 5); draw_status_view(); }
           else if (c == '2') {
             status_edit_idx = 1;
             draw_status_view();
