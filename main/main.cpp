@@ -347,7 +347,8 @@ static RadioType g_radio = RadioType::NONE;
 static std::string g_ant = "EFHW";
 static std::string g_comment1 = "MiniFT8 /Radio /Ant";
 static bool g_rxtx_log = true;
-static bool tx_task_running = false;
+static TaskHandle_t s_tx_task_handle = NULL;
+static portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
 static int menu_page = 0;
 static int menu_edit_idx = -1;
 static std::string menu_edit_buf;
@@ -1500,7 +1501,6 @@ static void select_next_from_queue() {
     if (tx_queue.empty()) {
       tx_next = TxEntry{};
       current_tx_parity = -1;
-      tx_task_running = false;
       return;
     }
     auto pick_with_parity = [&](int parity) -> bool {
@@ -1580,10 +1580,22 @@ struct TxTaskContext {
 static void tx_send_task(void* param);
 
 static void schedule_tx_if_idle() {
-  if (tx_task_running) return;
+  // Use critical section to atomically check and set task handle
+  taskENTER_CRITICAL(&mux);
+  if (s_tx_task_handle != NULL) {
+    taskEXIT_CRITICAL(&mux);
+    return;
+  }
+  // Mark as "about to create" by setting a sentinel value
+  s_tx_task_handle = (TaskHandle_t)1;
+  taskEXIT_CRITICAL(&mux);
+
   maybe_enqueue_beacon();
   maybe_load_next_from_queue();
-  if (tx_entry_is_empty(tx_next)) return;
+  if (tx_entry_is_empty(tx_next)) {
+    s_tx_task_handle = NULL;
+    return;
+  }
   int64_t now_ms = rtc_now_ms();
   int target_parity = tx_next.slot_id & 1;
   int64_t now_slot = now_ms / 15000;
@@ -1597,7 +1609,10 @@ static void schedule_tx_if_idle() {
   if (can_inline) {
     // start in current slot, skip elapsed symbols
     skip_tones = (int)(slot_ms / 160);
-    if (skip_tones >= 79) return; // nothing to send
+    if (skip_tones >= 79) {
+      s_tx_task_handle = NULL;
+      return; // nothing to send
+    }
     delay_ms = 0;
   } else {
     if (slot_ms != 0) slot_idx += 1; // next boundary
@@ -1612,8 +1627,7 @@ static void schedule_tx_if_idle() {
 
   current_tx_parity = target_parity;
   auto* ctx = new TxTaskContext{tx_next, (int)delay_ms, tx_next_idx, (int)slot_idx, skip_tones};
-  tx_task_running = true;
-  xTaskCreatePinnedToCore(tx_send_task, "tx_sched", 4096, ctx, 5, nullptr, 0);
+  xTaskCreatePinnedToCore(tx_send_task, "tx_sched", 4096, ctx, 5, &s_tx_task_handle, 0);
 }
 
 static void enqueue_tx_with_preference(const TxEntry& te, bool reply_to_me) {
@@ -1654,7 +1668,7 @@ static void tx_send_task(void* param) {
       if (!valid) {
         tx_next = TxEntry{};
         tx_next_idx = -1;
-        tx_task_running = false;
+        s_tx_task_handle = NULL;
         maybe_load_next_from_queue();
         schedule_tx_if_idle();
         vTaskDelete(NULL);
@@ -1665,7 +1679,7 @@ static void tx_send_task(void* param) {
     ftx_message_rc_t rc = ftx_message_encode(&msg, NULL, e_ptr->text.c_str());
     if (rc != FTX_MESSAGE_RC_OK) {
       ESP_LOGE(TAG, "Encode failed for TX");
-      tx_task_running = false;
+      s_tx_task_handle = NULL;
       vTaskDelete(NULL);
       return;
   }
@@ -1709,7 +1723,7 @@ static void tx_send_task(void* param) {
       if (ta_int == last_ta_int && ta_frac == last_ta_frac) return;
       char ta[16];
       snprintf(ta, sizeof(ta), "TA%04d.%02d;", ta_int, ta_frac);
-      cat_cdc_send(reinterpret_cast<const uint8_t*>(ta), strlen(ta), 50);
+      cat_cdc_send(reinterpret_cast<const uint8_t*>(ta), strlen(ta), 10);
       last_ta_int = ta_int;
       last_ta_frac = ta_frac;
     };
@@ -1771,7 +1785,7 @@ static void tx_send_task(void* param) {
       select_next_from_queue(); // will pick new parity if available
     }
     redraw_tx_view();
-    tx_task_running = false;
+    s_tx_task_handle = NULL;
     maybe_load_next_from_queue();
     schedule_tx_if_idle();
     vTaskDelete(NULL);
@@ -2538,7 +2552,7 @@ static void app_task_core0(void* /*param*/) {
     .base_path = "/spiffs",
     .partition_label = NULL,
     .max_files = 5,
-    .format_if_mount_failed = false
+    .format_if_mount_failed = true
   };
   ESP_ERROR_CHECK(esp_vfs_spiffs_register(&conf));
   init_soft_uart();
