@@ -2456,8 +2456,12 @@ static void app_task_core0(void* /*param*/) {
   menu_flash_tick();
   rx_flash_tick();
   apply_pending_sync();
-  // TX scheduling/check
-  schedule_tx_if_idle();
+  // NOTE: Don't call schedule_tx_if_idle here! TX scheduling happens:
+  // 1. After decode processing (decode_monitor_results)
+  // 2. After user touch on decoded message
+  // 3. After sending free text
+  // Calling it in the main loop causes a race condition where TX is
+  // scheduled before decodes update the state.
 
   static int last_status_uac = -1; // -1 forces a redraw on first entry
   int cur_uac = uac_is_streaming() ? 1 : 0;
