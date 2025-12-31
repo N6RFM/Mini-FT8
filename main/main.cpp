@@ -17,8 +17,7 @@ extern "C" {
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "esp_heap_caps.h"
-#include "tx_queue.h"
-#include "active_calls.h"
+#include "autoseq.h"
 #include <M5Cardputer.h>
 #include <sstream>
 #include <iterator>
@@ -229,7 +228,6 @@ static const char* TAG = "FT8";
 enum class UIMode { RX, TX, BAND, MENU, HOST, CONTROL, DEBUG, LIST, STATUS, QSO };
 static UIMode ui_mode = UIMode::RX;
 static int tx_page = 0;
-static int tx_selected_idx = -1;  // index into tx_queue (not including tx_next)
 static std::vector<UiRxLine> g_rx_lines;
 int64_t g_decode_slot_idx = -1; // set at decode trigger to tag RX lines with slot parity
 static const char* STATION_FILE = "/spiffs/StationData.ini";
@@ -267,7 +265,9 @@ static int debug_page = 0;
 static const size_t DEBUG_MAX_LINES = 18; // 3 pages
 static void debug_log_line(const std::string& msg);
 static void host_handle_line(const std::string& line);
-static TxEntry make_tx_entry(int step, const std::string& dxcall, int rpt_snr, int slot_id, int offset_hz);
+// TX entry for display and scheduling (populated by autoseq)
+static AutoseqTxEntry g_pending_tx;
+static bool g_pending_tx_valid = false;
 static void host_process_bytes(const uint8_t* buf, size_t len);
 static void poll_host_uart();
 static void poll_ble_uart();
@@ -375,25 +375,14 @@ static void rx_flash_tick();
 #if ENABLE_BLE
 static uint8_t g_own_addr_type;
 #endif
-static bool tx_entry_is_empty(const TxEntry& e);
-static bool tx_entry_is_rr(const TxEntry& e);
-static void enqueue_tx_with_preference(const TxEntry& te, bool reply_to_me);
 static bool looks_like_grid(const std::string& s);
 static bool looks_like_report(const std::string& s, int& out);
 static std::string g_last_reply_text;
 static void rebuild_active_bands();
-static void debug_dump_tx_state(const char* where);
 static void schedule_tx_if_idle();
-static void maybe_load_next_from_queue();
-static void select_next_from_queue();
-static int tx_next_idx = -1;
-static int current_tx_parity = -1; // 0 even,1 odd, -1 unset
-static int64_t last_tx_slot_idx = -1000;
 static int64_t last_beacon_slot = -1000;
 static bool g_sync_pending = false;
 static int g_sync_delta_ms = 0;
-static void schedule_tx_if_idle();
-static void maybe_load_next_from_queue();
 static void maybe_enqueue_beacon();
 static void qso_load_file_list();
 static void qso_load_entries(const std::string& path);
@@ -736,36 +725,27 @@ struct WAVHeader {
 }
 
 static void redraw_tx_view() {
-  if (tx_entry_is_empty(tx_next)) {
-    select_next_from_queue();
-  }
+  // Get QSO states from autoseq for display
   std::vector<std::string> qtext;
-    std::vector<bool> marks;
-    std::vector<int> slots;
-    qtext.reserve(tx_queue.size());
-    marks.reserve(tx_queue.size());
-    slots.reserve(tx_queue.size() + 1);
-  for (size_t i = 0; i < tx_queue.size(); ++i) {
-    const auto &e = tx_queue[i];
-    qtext.push_back(tx_entry_display(e, true)); // queue lines show repeat counter for normal entries
-    marks.push_back(e.mark_delete);
-    slots.push_back(e.slot_id & 1);
+  autoseq_get_qso_states(qtext);
+
+  std::vector<bool> marks(qtext.size(), false);  // No delete marks with autoseq
+  std::vector<int> slots;
+
+  // Slot color for pending TX
+  slots.push_back(g_pending_tx_valid ? (g_pending_tx.slot_id & 1) : 0);
+  // All QSO entries use their context's slot
+  for (size_t i = 0; i < qtext.size(); ++i) {
+    slots.push_back(0);  // Default to even; autoseq manages internally
   }
-  slots.insert(slots.begin(), tx_next.slot_id & 1); // slot for next at index 0
-    std::string next_line;
-    if (!tx_next.text.empty()) {
-      next_line = tx_next.text;
-    } else if (tx_next.dxcall == "FreeText") {
-      next_line = !tx_next.text.empty() ? tx_next.text : tx_next.field3;
-    } else if (!tx_entry_is_empty(tx_next)) {
-      next_line = tx_next.dxcall + " " + g_call;
-      if (!tx_next.field3.empty()) {
-        next_line += " ";
-        next_line += tx_next.field3;
-      }
-    }
-    ui_draw_tx(next_line, qtext, tx_page, tx_selected_idx, marks, slots);
+
+  std::string next_line;
+  if (g_pending_tx_valid && !g_pending_tx.text.empty()) {
+    next_line = g_pending_tx.text;
   }
+
+  ui_draw_tx(next_line, qtext, tx_page, -1, marks, slots);
+}
 
 static void draw_band_view() {
   std::vector<std::string> lines;
@@ -1312,103 +1292,18 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
     }
   }
 
-  // Auto-hint TX for reply-to-me (first one only; dedup by text)
+  // Auto-sequencing for reply-to-me messages
   if (!to_me.empty()) {
-    const UiRxLine& l = to_me.front();
-    if (g_last_reply_text != l.text) {
-      int step = 0;
-      int rpt = l.snr;
-      int parsed = 0;
-      std::string f3 = l.field3;
-      if (f3 == "RR73" || f3 == "73" || f3 == "RRR") {
-        step = 5;
-      } else if (!f3.empty() && (f3[0] == 'R' || f3[0] == 'r')) {
-        if (looks_like_report(f3.substr(1), parsed)) rpt = parsed;
-        step = 4; // send RR73
-      } else if (looks_like_grid(f3)) {
-        step = 2; // they sent grid -> send report
-      } else if (looks_like_report(f3, parsed)) {
-        rpt = parsed;
-        step = 3; // they sent report -> send Rreport
-      } else {
-        step = 3; // default to Rreport
-      }
-      // Active calls tracking
-      bool is_rr73 = (f3 == "RR73" || f3 == "RRR");
-      bool is_73 = (f3 == "73");
-      bool is_tx3 = false;
-      int tx3_rpt = -99;
-      if (!f3.empty() && (f3[0] == 'R' || f3[0] == 'r')) {
-        std::string rpt_only = f3.substr(1);
-        if (looks_like_report(rpt_only, parsed)) {
-          is_tx3 = true;
-          tx3_rpt = parsed;
-        }
-      }
-      int seq = 0;
-      if (looks_like_grid(f3)) seq = 1;
-      else if (looks_like_report(f3, parsed)) seq = 2;
-      else if (is_rr73) seq = 4;
-      else if (is_73) seq = 5;
-      std::string dx = !l.field2.empty() ? l.field2 : l.field1;
-      ActiveCall* existing = active_calls_find(dx);
-      std::string dxgrid_arg;
-      if (looks_like_grid(f3)) {
-        dxgrid_arg = f3;
-      } else if (existing) {
-        dxgrid_arg = existing->dxgrid;
-      } else {
-        dxgrid_arg.clear();
-      }
-      ActiveCall* ac = active_calls_touch(dx,
-                         dxgrid_arg, l.snr, rpt, l.offset_hz, l.slot_id, seq, is_rr73 || is_73);
+    // Feed all to-me messages to autoseq
+    autoseq_on_decodes(to_me);
 
-      if (!dx.empty() && step > 0) {
-        TxEntry te = make_tx_entry(step, dx, rpt, l.slot_id ^ 1, l.offset_hz);
-        // Replace current tx_next immediately and enqueue for tracking
-        tx_next = te;
-        tx_next_idx = -1;
-        // Remove any queued entries for this dxcall to avoid stale responses
-        for (auto it = tx_queue.begin(); it != tx_queue.end();) {
-          if (!it->mark_delete && it->dxcall == dx) {
-            it = tx_queue.erase(it);
-          } else {
-            ++it;
-          }
-        }
-        enqueue_tx_with_preference(te, true);
-        schedule_tx_if_idle();
-        g_last_reply_text = l.text;
-      }
-      if (is_tx3) {
-        int rst_sent = ac ? ac->rpt_snr : -99;
-        int rst_rcvd = (tx3_rpt != -99) ? tx3_rpt : (ac ? ac->rx_snr : -99);
-        log_adif_entry(dx, ac ? ac->dxgrid : l.field3, rst_sent, rst_rcvd);
-      }
-      // Signoff handling for inbound RR73/73
-      if (is_rr73) {
-        // They sent RR73 to us: enqueue our 73
-        for (auto it = tx_queue.begin(); it != tx_queue.end();) {
-          if (!it->mark_delete && it->dxcall == dx) it = tx_queue.erase(it); else ++it;
-        }
-        TxEntry t73 = make_tx_entry(5, dx, rpt, l.slot_id ^ 1, l.offset_hz);
-        t73.repeat_counter = 1;
-        enqueue_tx_with_preference(t73, true);
-        int rst_sent = ac ? ac->rpt_snr : -99;
-        int rst_rcvd = (rpt != -99) ? rpt : (ac ? ac->rx_snr : -99);
-        log_adif_entry(dx, l.field3, rst_sent, rst_rcvd);
-      } else if (is_73) {
-        // They sent final 73: drop any pending RR and mark signoff
-        for (size_t qi = 0; qi < tx_queue.size(); ++qi) {
-          if (!tx_queue[qi].mark_delete && tx_queue[qi].dxcall == dx &&
-              tx_entry_is_rr(tx_queue[qi])) {
-            tx_queue.erase(tx_queue.begin() + qi);
-            break;
-          }
-        }
-        active_calls_touch(dx, l.field3, l.snr, rpt, l.offset_hz, l.slot_id, seq, true);
-      }
+    // Update last reply text to avoid re-processing
+    if (!to_me.empty()) {
+      g_last_reply_text = to_me.front().text;
     }
+
+    // Schedule TX if idle
+    schedule_tx_if_idle();
   }
 
   std::vector<UiRxLine> merged;
@@ -1464,44 +1359,21 @@ static void log_tones(const uint8_t* tones, size_t n) {
   }
 }
 
-static void encode_and_log_tx_next() {
-    ftx_message_t msg;
-    std::string payload;
-  if (!tx_next.text.empty()) {
-    payload = tx_next.text;
-  } else if (tx_next.dxcall == "FreeText") {
-    payload = tx_next.field3;
-  } else {
-    payload = tx_next.dxcall;
-    if (!g_call.empty()) {
-      payload += " ";
-      payload += g_call;
-    }
-    if (!tx_next.field3.empty()) {
-      payload += " ";
-      payload += tx_next.field3;
-    } else if (!g_grid.empty()) {
-      payload += " ";
-      payload += g_grid;
-    }
+static void encode_and_log_pending_tx() {
+  if (!g_pending_tx_valid || g_pending_tx.text.empty()) {
+    debug_log_line("No pending TX to encode");
+    return;
   }
-  ftx_message_rc_t rc = ftx_message_encode(&msg, NULL, payload.c_str());
+  ftx_message_t msg;
+  ftx_message_rc_t rc = ftx_message_encode(&msg, NULL, g_pending_tx.text.c_str());
   if (rc != FTX_MESSAGE_RC_OK) {
     debug_log_line("Encode failed");
     return;
   }
   uint8_t tones[79] = {0};
   ft8_encode(msg.payload, tones);
-  debug_log_line(std::string("Tones for '") + payload + "'");
-    log_tones(tones, 79);
-}
-
-static bool tx_entry_is_empty(const TxEntry& e) {
-  return e.dxcall.empty() && e.field3.empty() && e.text.empty();
-}
-
-static bool tx_entry_is_rr(const TxEntry& e) {
-  return (e.field3 == "RR73" || e.field3 == "73" || e.field3 == "RRR");
+  debug_log_line(std::string("Tones for '") + g_pending_tx.text + "'");
+  log_tones(tones, 79);
 }
 
 static bool looks_like_grid(const std::string& s) {
@@ -1526,114 +1398,38 @@ static bool looks_like_report(const std::string& s, int& out) {
   return true;
 }
 
-static void debug_dump_tx_state(const char* where) {
-  ESP_LOGI("TXENG", "%s tx_next: dx=%s f3=%s slot=%d rep=%d", where,
-           tx_next.dxcall.c_str(), tx_next.field3.c_str(), tx_next.slot_id, tx_next.repeat_counter);
-  int idx = 0;
-  for (const auto& e : tx_queue) {
-    ESP_LOGI("TXENG", "  q[%d]: dx=%s f3=%s slot=%d rep=%d del=%d", idx,
-             e.dxcall.c_str(), e.field3.c_str(), e.slot_id, e.repeat_counter, e.mark_delete ? 1 : 0);
-    idx++;
-  }
-}
-
-static void maybe_load_next_from_queue() {
-  if (tx_entry_is_empty(tx_next)) {
-    select_next_from_queue();
-  }
-}
-
-static void select_next_from_queue() {
-    tx_next_idx = -1;
-    if (tx_queue.empty()) {
-      tx_next = TxEntry{};
-      current_tx_parity = -1;
-      return;
-    }
-    auto pick_with_parity = [&](int parity) -> bool {
-      for (int i = (int)tx_queue.size() - 1; i >= 0; --i) {
-        if (tx_queue[i].mark_delete) continue;
-        if ((tx_queue[i].slot_id & 1) != parity) continue;
-        tx_next_idx = i;
-        tx_next = tx_queue[i];
-        current_tx_parity = parity;
-        return true;
-      }
-      return false;
-    };
-    bool picked = false;
-    if (current_tx_parity != -1) {
-      picked = pick_with_parity(current_tx_parity);
-    }
-    if (!picked) {
-      current_tx_parity = -1;
-      // pick any (last), then set parity
-      for (int i = (int)tx_queue.size() - 1; i >= 0; --i) {
-        if (tx_queue[i].mark_delete) continue;
-        tx_next_idx = i;
-        tx_next = tx_queue[i];
-        current_tx_parity = tx_next.slot_id & 1;
-        picked = true;
-        break;
-      }
-    }
-    if (!picked) {
-      tx_next = TxEntry{};
-      current_tx_parity = -1;
-    }
-  }
-
 static void maybe_enqueue_beacon() {
   if (g_beacon == BeaconMode::OFF) return;
-  if (!tx_queue.empty()) return;
-  // If tx_next is already a beacon, allow replacement so each eligible slot injects anew.
-  if (!tx_entry_is_empty(tx_next)) {
-    bool is_beacon = (tx_next.dxcall == g_call && tx_next.text.rfind("CQ ", 0) == 0) ||
-                     (tx_next.dxcall == "FreeText");
-    if (!is_beacon) return;
-    tx_next = TxEntry{};
-    tx_next_idx = -1;
-  }
+  if (autoseq_has_active_qso()) return;  // Don't beacon during active QSO
 
   int64_t now_ms = rtc_now_ms();
   int64_t now_slot = now_ms / 15000;
   int parity = (int)(now_slot & 1);
 
-  int target_parity = 0;
   bool allow = false;
   switch (g_beacon) {
-    case BeaconMode::EVEN:   target_parity = 0; allow = (parity == 0); break;
-    case BeaconMode::ODD:    target_parity = 1; allow = (parity == 1); break;
-    //case BeaconMode::EVEN2:  target_parity = 0; allow = (parity == 0) && (now_slot >= last_beacon_slot + 2); break;
-    //case BeaconMode::ODD2:   target_parity = 1; allow = (parity == 1) && (now_slot >= last_beacon_slot + 2); break;
+    case BeaconMode::EVEN: allow = (parity == 0); break;
+    case BeaconMode::ODD:  allow = (parity == 1); break;
     default: break;
   }
   if (!allow) return;
   if (now_slot == last_beacon_slot) return;
 
-  TxEntry cq = make_tx_entry(6, g_call, 0, target_parity, g_offset_hz);
-  if (g_cq_type == CqType::CQFREETEXT) {
-    cq.text = g_free_text;
-    cq.field3 = g_free_text;
-    cq.dxcall = "FreeText";
-  }
-  cq.repeat_counter = 1;
-  // Beacon does not occupy the queue; load directly as next TX
-  tx_next = cq;
-  tx_next_idx = -1;
+  // Use autoseq to start CQ
+  autoseq_start_cq();
   last_beacon_slot = now_slot;
   debug_log_line("Beacon CQ queued");
 }
 
 struct TxTaskContext {
-  TxEntry e;
+  AutoseqTxEntry e;
   int delay_ms;
-  int queue_idx;
-  int slot_idx;
+  int64_t slot_idx;
   int skip_tones;
 };
 
 static void tx_send_task(void* param);
+static int64_t s_last_tx_slot_idx = -1000;
 
 static void schedule_tx_if_idle() {
   // Use critical section to atomically check and set task handle
@@ -1646,18 +1442,31 @@ static void schedule_tx_if_idle() {
   s_tx_task_handle = (TaskHandle_t)1;
   taskEXIT_CRITICAL(&mux);
 
+  // Try beacon first
   maybe_enqueue_beacon();
-  maybe_load_next_from_queue();
-  if (tx_entry_is_empty(tx_next)) {
-    s_tx_task_handle = NULL;
-    return;
-  }
+
+  // Get timing info
   int64_t now_ms = rtc_now_ms();
-  int target_parity = tx_next.slot_id & 1;
   int64_t now_slot = now_ms / 15000;
   int64_t slot_ms = now_ms % 15000;
   int now_parity = (int)(now_slot & 1);
-  bool can_inline = (target_parity == now_parity) && (slot_ms < 4000) && (now_slot >= last_tx_slot_idx + 2);
+
+  // Ask autoseq to tick (may schedule TX internally)
+  autoseq_tick(now_slot, now_parity, (int)(15000 - slot_ms));
+
+  // Try to fetch pending TX from autoseq
+  AutoseqTxEntry pending;
+  if (!autoseq_fetch_pending_tx(pending)) {
+    s_tx_task_handle = NULL;
+    g_pending_tx_valid = false;
+    return;
+  }
+
+  g_pending_tx = pending;
+  g_pending_tx_valid = true;
+
+  int target_parity = pending.slot_id & 1;
+  bool can_inline = (target_parity == now_parity) && (slot_ms < 4000) && (now_slot >= s_last_tx_slot_idx + 2);
 
   int64_t slot_idx = now_slot;
   int64_t delay_ms = 0;
@@ -1667,13 +1476,13 @@ static void schedule_tx_if_idle() {
     skip_tones = (int)(slot_ms / 160);
     if (skip_tones >= 79) {
       s_tx_task_handle = NULL;
-      return; // nothing to send
+      return;
     }
     delay_ms = 0;
   } else {
-    if (slot_ms != 0) slot_idx += 1; // next boundary
-    if (slot_idx <= last_tx_slot_idx + 1) {
-      slot_idx = last_tx_slot_idx + 2; // enforce one blank slot after last TX
+    if (slot_ms != 0) slot_idx += 1;
+    if (slot_idx <= s_last_tx_slot_idx + 1) {
+      slot_idx = s_last_tx_slot_idx + 2;
     }
     while ((slot_idx & 1) != target_parity) {
       slot_idx += 1;
@@ -1681,248 +1490,107 @@ static void schedule_tx_if_idle() {
     delay_ms = slot_idx * 15000 - now_ms;
   }
 
-  current_tx_parity = target_parity;
-  auto* ctx = new TxTaskContext{tx_next, (int)delay_ms, tx_next_idx, (int)slot_idx, skip_tones};
+  auto* ctx = new TxTaskContext{pending, (int)delay_ms, slot_idx, skip_tones};
   xTaskCreatePinnedToCore(tx_send_task, "tx_sched", 4096, ctx, 5, &s_tx_task_handle, 0);
 }
 
-static void enqueue_tx_with_preference(const TxEntry& te, bool reply_to_me) {
-  tx_enqueue(te);
-  bool empty_next = tx_entry_is_empty(tx_next);
-  if (empty_next) {
-    tx_next_idx = (int)tx_queue.size() - 1;
-    tx_next = te;
-  } else if (reply_to_me) {
-    bool cur_rr = tx_entry_is_rr(tx_next);
-    bool new_rr = tx_entry_is_rr(te);
-    bool flip_slot = ((tx_next.slot_id ^ te.slot_id) & 1) != 0;
-    if (!cur_rr || (cur_rr && new_rr && flip_slot)) {
-      tx_next_idx = (int)tx_queue.size() - 1;
-      tx_next = te;
-    }
-  }
-  debug_dump_tx_state(reply_to_me ? "enqueue (reply)" : "enqueue");
-  redraw_tx_view();
-  schedule_tx_if_idle();
-}
-
 static void tx_send_task(void* param) {
-    std::unique_ptr<TxTaskContext> ctx(reinterpret_cast<TxTaskContext*>(param));
+  std::unique_ptr<TxTaskContext> ctx(reinterpret_cast<TxTaskContext*>(param));
   if (ctx->delay_ms > 0) vTaskDelay(pdMS_TO_TICKS(ctx->delay_ms));
-  // Use the latest tx_next if present to avoid sending stale payloads.
-  TxEntry* e_ptr = &ctx->e;
-  if (!tx_entry_is_empty(tx_next)) {
-    *e_ptr = tx_next;
-  }
 
-    // If the queued entry was deleted before send, abort.
-    if (ctx->queue_idx >= 0) {
-      bool valid = false;
-      if (ctx->queue_idx < (int)tx_queue.size()) {
-        const auto &qe = tx_queue[ctx->queue_idx];
-        if (!qe.mark_delete && qe.dxcall == e_ptr->dxcall && qe.field3 == e_ptr->field3 &&
-            qe.slot_id == e_ptr->slot_id && qe.offset_hz == e_ptr->offset_hz) {
-          valid = true;
-        }
-      }
-      if (!valid) {
-        tx_next = TxEntry{};
-        tx_next_idx = -1;
-        s_tx_task_handle = NULL;
-        maybe_load_next_from_queue();
-        schedule_tx_if_idle();
-        vTaskDelete(NULL);
-        return;
-      }
-    }
-    ftx_message_t msg;
-    ftx_message_rc_t rc = ftx_message_encode(&msg, NULL, e_ptr->text.c_str());
-    if (rc != FTX_MESSAGE_RC_OK) {
-      ESP_LOGE(TAG, "Encode failed for TX");
-      s_tx_task_handle = NULL;
-      vTaskDelete(NULL);
-      return;
-  }
-    uint8_t tones[79] = {0};
-    ft8_encode(msg.payload, tones);
-    log_rxtx_line('T', e_ptr->snr, e_ptr->offset_hz, e_ptr->text, e_ptr->repeat_counter);
-
-    // CAT: compute base TX audio offset
-    int base_hz = 0;
-    auto rand_off = []() {
-      uint32_t r = esp_random();
-      return 500 + (int)(r % 2001); // 500-2500
-    };
-    if (g_offset_src == OffsetSrc::CURSOR) {
-      base_hz = g_offset_hz;
-    } else if (g_offset_src == OffsetSrc::RX && e_ptr->offset_hz > 0 && e_ptr->text.rfind("CQ ", 0) != 0) {
-      base_hz = e_ptr->offset_hz;
-    } else {
-      base_hz = rand_off();
-    }
-
-    bool cat_ok = cat_cdc_ready();
-    if (cat_ok) {
-      const char* md = "MD6;";
-      const char* tx = "TX;";
-      cat_cdc_send(reinterpret_cast<const uint8_t*>(md), strlen(md), 200);
-      cat_cdc_send(reinterpret_cast<const uint8_t*>(tx), strlen(tx), 200);
-    }
-
-    int start_tone = ctx->skip_tones;
-    if (start_tone >= 79) start_tone = 79;
-    if (ctx->skip_tones > 0) {
-      ESP_LOGI("TXTONE", "Skipping first %d tones due to late start", ctx->skip_tones);
-    }
-    int last_ta_int = -1;
-    int last_ta_frac = -1;
-    auto send_ta = [&](float tone_hz) {
-      int ta_int = (int)lrintf(tone_hz);
-      float frac = tone_hz - (float)ta_int;
-      int ta_frac = (int)lrintf(frac * 100.0f); // two decimals
-      if (ta_int == last_ta_int && ta_frac == last_ta_frac) return;
-      char ta[16];
-      snprintf(ta, sizeof(ta), "TA%04d.%02d;", ta_int, ta_frac);
-      cat_cdc_send(reinterpret_cast<const uint8_t*>(ta), strlen(ta), 10);
-      last_ta_int = ta_int;
-      last_ta_frac = ta_frac;
-    };
-
-    // Send first tone TA if CAT is ready
-    if (cat_ok && start_tone < 79) {
-      float tone_hz = base_hz + 6.25f * tones[start_tone];
-      send_ta(tone_hz);
-    }
-
-    for (int i = start_tone; i < 79; ++i) {
-      ESP_LOGI("TXTONE", "%02d %u", i, (unsigned)tones[i]);
-      fft_waterfall_tx_tone(tones[i]);
-      if (cat_ok) {
-        float tone_hz = base_hz + 6.25f * tones[i];
-        send_ta(tone_hz);
-      }
-      vTaskDelay(pdMS_TO_TICKS(160));
-    }
-    if (cat_ok) {
-      const char* rx = "RX;";
-      cat_cdc_send(reinterpret_cast<const uint8_t*>(rx), strlen(rx), 200);
-    }
-    // record slot index for spacing
-    last_tx_slot_idx = ctx->slot_idx;
-    int parity = current_tx_parity;
-    int prev_idx = ctx->queue_idx;
-    // decrement repeat_counter and remove if needed
-    if (prev_idx >= 0 && prev_idx < (int)tx_queue.size()) {
-      auto &qe = tx_queue[prev_idx];
-      if (qe.dxcall == e_ptr->dxcall && qe.field3 == e_ptr->field3 &&
-          qe.slot_id == e_ptr->slot_id && qe.offset_hz == e_ptr->offset_hz) {
-        if (qe.repeat_counter > 0) qe.repeat_counter--;
-        if (qe.repeat_counter <= 0 || qe.mark_delete) {
-          tx_queue.erase(tx_queue.begin() + prev_idx);
-          prev_idx = -1;
-        }
-      }
-    }
-    // Round-robin: advance to next entry in same parity group if available
-    tx_next_idx = -1;
-    if (!tx_queue.empty() && parity != -1) {
-      int n = (int)tx_queue.size();
-      int start = prev_idx >= 0 ? (prev_idx % n) : 0;
-      for (int step = 1; step <= n; ++step) {
-        int idx = (start + step) % n;
-        const auto &qe = tx_queue[idx];
-        if (qe.mark_delete) continue;
-        if ((qe.slot_id & 1) != parity) continue;
-        tx_next_idx = idx;
-        tx_next = qe;
-        current_tx_parity = parity;
-        break;
-      }
-    }
-    if (tx_next_idx == -1) {
-      tx_next = TxEntry{};
-      current_tx_parity = -1;
-      select_next_from_queue(); // will pick new parity if available
-    }
-    redraw_tx_view();
+  const AutoseqTxEntry& e = ctx->e;
+  if (e.text.empty()) {
     s_tx_task_handle = NULL;
-    maybe_load_next_from_queue();
     schedule_tx_if_idle();
     vTaskDelete(NULL);
+    return;
   }
 
-  // Map sequence steps (6,1,2,3,4,5) to FT8 messages
-static TxEntry make_tx_entry(int step, const std::string& dxcall, int rpt_snr, int slot_id, int offset_hz) {
-  TxEntry e{};
-  e.dxcall = dxcall;
-  e.offset_hz = offset_hz;
-  e.slot_id = slot_id;
-  e.repeat_counter = 5;
-  e.mark_delete = false;
-  char buf[16];
-  switch (step) {
-    case 6: { // CQ mycall grid
-      std::string prefix = "CQ";
-      switch (g_cq_type) {
-        case CqType::CQSOTA: prefix = "CQ SOTA"; break;
-        case CqType::CQPOTA: prefix = "CQ POTA"; break;
-        case CqType::CQQRP:  prefix = "CQ QRP";  break;
-        case CqType::CQFD:   prefix = "CQ FD";   break;
-        case CqType::CQFREETEXT:
-          e.text = g_cq_freetext;
-          e.field3 = g_cq_freetext;
-          e.dxcall = "FreeText";
-          e.snr = rpt_snr;
-          break;
-        default: break;
-      }
-      if (e.text.empty()) {
-        e.text = prefix + " " + g_call + " " + g_grid;
-        e.field3 = g_grid;
-      }
-      e.field3 = g_grid;
-      e.snr = rpt_snr;
-      break;
-    }
-    case 1: { // dxcall mycall grid
-      e.text = dxcall + " " + g_call + " " + g_grid;
-      e.field3 = g_grid;
-      e.snr = rpt_snr;
-      break;
-    }
-    case 2: { // dxcall mycall rpt
-      snprintf(buf, sizeof(buf), "%d", rpt_snr);
-      e.text = dxcall + " " + g_call + " " + buf;
-      e.field3 = buf;
-      e.snr = rpt_snr;
-      break;
-    }
-    case 3: { // dxcall mycall Rrpt
-      snprintf(buf, sizeof(buf), "%d", rpt_snr);
-      e.text = dxcall + " " + g_call + " R" + std::string(buf);
-      e.field3 = std::string("R") + buf;
-      e.snr = rpt_snr;
-      break;
-    }
-    case 4: { // dxcall mycall RR73
-      e.text = dxcall + " " + g_call + " RR73";
-      e.field3 = "RR73";
-      e.snr = rpt_snr;
-      break;
-    }
-    case 5: { // dxcall mycall 73
-      e.text = dxcall + " " + g_call + " 73";
-      e.field3 = "73";
-      e.snr = rpt_snr;
-      break;
-    }
-    default:
-      break;
+  ftx_message_t msg;
+  ftx_message_rc_t rc = ftx_message_encode(&msg, NULL, e.text.c_str());
+  if (rc != FTX_MESSAGE_RC_OK) {
+    ESP_LOGE(TAG, "Encode failed for TX");
+    s_tx_task_handle = NULL;
+    vTaskDelete(NULL);
+    return;
   }
-  return e;
+  uint8_t tones[79] = {0};
+  ft8_encode(msg.payload, tones);
+  log_rxtx_line('T', 0, e.offset_hz, e.text, e.repeat_counter);
+
+  // CAT: compute base TX audio offset
+  int base_hz = 0;
+  auto rand_off = []() {
+    uint32_t r = esp_random();
+    return 500 + (int)(r % 2001); // 500-2500
+  };
+  if (g_offset_src == OffsetSrc::CURSOR) {
+    base_hz = g_offset_hz;
+  } else if (g_offset_src == OffsetSrc::RX && e.offset_hz > 0 && e.text.rfind("CQ ", 0) != 0) {
+    base_hz = e.offset_hz;
+  } else {
+    base_hz = rand_off();
+  }
+
+  bool cat_ok = cat_cdc_ready();
+  if (cat_ok) {
+    const char* md = "MD6;";
+    const char* tx = "TX;";
+    cat_cdc_send(reinterpret_cast<const uint8_t*>(md), strlen(md), 200);
+    cat_cdc_send(reinterpret_cast<const uint8_t*>(tx), strlen(tx), 200);
+  }
+
+  int start_tone = ctx->skip_tones;
+  if (start_tone >= 79) start_tone = 79;
+  if (ctx->skip_tones > 0) {
+    ESP_LOGI("TXTONE", "Skipping first %d tones due to late start", ctx->skip_tones);
+  }
+  int last_ta_int = -1;
+  int last_ta_frac = -1;
+  auto send_ta = [&](float tone_hz) {
+    int ta_int = (int)lrintf(tone_hz);
+    float frac = tone_hz - (float)ta_int;
+    int ta_frac = (int)lrintf(frac * 100.0f); // two decimals
+    if (ta_int == last_ta_int && ta_frac == last_ta_frac) return;
+    char ta[16];
+    snprintf(ta, sizeof(ta), "TA%04d.%02d;", ta_int, ta_frac);
+    cat_cdc_send(reinterpret_cast<const uint8_t*>(ta), strlen(ta), 10);
+    last_ta_int = ta_int;
+    last_ta_frac = ta_frac;
+  };
+
+  // Send first tone TA if CAT is ready
+  if (cat_ok && start_tone < 79) {
+    float tone_hz = base_hz + 6.25f * tones[start_tone];
+    send_ta(tone_hz);
+  }
+
+  for (int i = start_tone; i < 79; ++i) {
+    ESP_LOGI("TXTONE", "%02d %u", i, (unsigned)tones[i]);
+    fft_waterfall_tx_tone(tones[i]);
+    if (cat_ok) {
+      float tone_hz = base_hz + 6.25f * tones[i];
+      send_ta(tone_hz);
+    }
+    vTaskDelay(pdMS_TO_TICKS(160));
+  }
+  if (cat_ok) {
+    const char* rx = "RX;";
+    cat_cdc_send(reinterpret_cast<const uint8_t*>(rx), strlen(rx), 200);
+  }
+
+  // Record slot index for spacing and notify autoseq
+  s_last_tx_slot_idx = ctx->slot_idx;
+  autoseq_mark_sent(ctx->slot_idx);
+
+  g_pending_tx_valid = false;
+  redraw_tx_view();
+  s_tx_task_handle = NULL;
+  schedule_tx_if_idle();
+  vTaskDelete(NULL);
 }
 
-  static void draw_menu_view() {
+static void draw_menu_view() {
     if (menu_long_edit) {
       draw_menu_long_edit();
       return;
@@ -2545,17 +2213,16 @@ static void init_soft_uart() {
 
 
 static void enter_mode(UIMode new_mode) {
-  if (ui_mode == UIMode::TX && new_mode != UIMode::TX) {
-    tx_commit_deletions();
-  }
+  // No special handling needed when leaving TX mode - autoseq manages queue internally
   if (ui_mode == UIMode::STATUS && new_mode != UIMode::STATUS) {
   if (g_beacon != g_status_beacon_temp) {
     g_beacon = g_status_beacon_temp;
     save_station_data();
     if (g_beacon == BeaconMode::OFF) {
-      // Abort any pending beacon TX and clear next
-      tx_next = TxEntry{};
-      tx_next_idx = -1;
+      // Abort any pending TX and clear autoseq
+      autoseq_clear();
+      g_pending_tx = AutoseqTxEntry{};
+      g_pending_tx_valid = false;
     }
   }
   status_edit_idx = -1;
@@ -2571,7 +2238,6 @@ static void enter_mode(UIMode new_mode) {
       break;
     case UIMode::TX:
       tx_page = 0;
-      tx_selected_idx = -1;
       redraw_tx_view();
       break;
     case UIMode::BAND:
@@ -2650,10 +2316,16 @@ static void app_task_core0(void* /*param*/) {
   std::vector<UiRxLine> empty;
   ui_set_rx_list(empty);
   ui_draw_rx();
-  tx_init();
-  tx_engine_reset();
+
+  // Initialize autoseq engine
+  autoseq_init();
+  autoseq_set_adif_callback(log_adif_entry);
+
   ui_mode = UIMode::RX;
   load_station_data();
+
+  // Update autoseq with station info after loading
+  autoseq_set_station(g_call, g_grid);
 
   ESP_LOGI(TAG, "Free heap: %u, internal: %u, 8bit: %u",
            heap_caps_get_free_size(MALLOC_CAP_DEFAULT),
@@ -2856,74 +2528,30 @@ static void app_task_core0(void* /*param*/) {
     switch (ui_mode) {
       case UIMode::RX: {
         int sel = ui_handle_rx_key(c);
-          if (sel >= 0 && sel < (int)g_rx_lines.size()) {
-            std::string dx = !g_rx_lines[sel].field2.empty() ? g_rx_lines[sel].field2 : g_rx_lines[sel].field1;
-            if (!dx.empty()) {
-              int start_step = g_skip_tx1 ? 2 : 1;
-              TxEntry te = make_tx_entry(start_step, dx, g_rx_lines[sel].snr, g_rx_lines[sel].slot_id ^ 1, g_rx_lines[sel].offset_hz);
-              enqueue_tx_with_preference(te, false);
-              // Start active call at TX6 (we initiated), rpt_snr unknown
-              std::string dxgrid_init;
-              if (looks_like_grid(g_rx_lines[sel].field3)) dxgrid_init = g_rx_lines[sel].field3;
-              active_calls_touch(dx, dxgrid_init, g_rx_lines[sel].snr, -99, g_rx_lines[sel].offset_hz, g_rx_lines[sel].slot_id, 6, false);
-            }
-            rx_flash_idx = sel;
-            rx_flash_deadline = rtc_now_ms() + 500;
+        if (sel >= 0 && sel < (int)g_rx_lines.size()) {
+          // User tapped on a decoded message - let autoseq handle it
+          autoseq_on_touch(g_rx_lines[sel]);
+          schedule_tx_if_idle();
+          rx_flash_idx = sel;
+          rx_flash_deadline = rtc_now_ms() + 500;
           ui_draw_rx(rx_flash_idx);
         }
-          break;
+        break;
+      }
+      case UIMode::TX: {
+        // TX view shows QSO states from autoseq
+        // Pagination through QSO list (max 9 QSOs)
+        int qso_count = autoseq_queue_size();
+        int start_idx = tx_page * 5;
+        if (c == ';') {
+          if (tx_page > 0) { tx_page--; redraw_tx_view(); }
+        } else if (c == '.') {
+          if (start_idx + 5 < qso_count) { tx_page++; redraw_tx_view(); }
+        } else if (c == 'e' || c == 'E') {
+          encode_and_log_pending_tx();
         }
-          case UIMode::TX: {
-            int start_idx = tx_page * 5;
-            if (c == ';') {
-              if (tx_page > 0) { tx_page--; redraw_tx_view(); }
-            } else if (c == '.') {
-              if (start_idx + 5 < (int)tx_queue.size()) { tx_page++; redraw_tx_view(); }
-            } else if (c == '1') {
-              if (!tx_queue.empty()) {
-                int parity = current_tx_parity;
-                if (parity == -1) {
-                  if (!tx_entry_is_empty(tx_next)) parity = tx_next.slot_id & 1;
-                  else parity = tx_queue.back().slot_id & 1;
-                }
-                // ensure we have a current index
-                if (tx_next_idx < 0 || tx_next_idx >= (int)tx_queue.size()) {
-                  select_next_from_queue();
-                } else {
-                  int found = -1;
-                  // search forward from next position
-                  for (int i = tx_next_idx + 1; i < (int)tx_queue.size(); ++i) {
-                    if (tx_queue[i].mark_delete) continue;
-                    if ((tx_queue[i].slot_id & 1) == parity) { found = i; break; }
-                  }
-                  // wrap to beginning if needed
-                  if (found == -1) {
-                    for (int i = 0; i <= tx_next_idx; ++i) {
-                      if (tx_queue[i].mark_delete) continue;
-                      if ((tx_queue[i].slot_id & 1) == parity) { found = i; break; }
-                    }
-                  }
-                  if (found != -1) {
-                    tx_next_idx = found;
-                    tx_next = tx_queue[found];
-                    redraw_tx_view();
-                    schedule_tx_if_idle();
-                  }
-                }
-              }
-            } else if (c == 'e' || c == 'E') {
-              encode_and_log_tx_next();
-            } else if (c >= '2' && c <= '6') {
-              int line = c - '2'; // 0..4
-              int idx = start_idx + line;
-              if (idx >= 0 && idx < (int)tx_queue.size()) {
-                tx_queue[idx].mark_delete = !tx_queue[idx].mark_delete;
-                select_next_from_queue();
-                redraw_tx_view();
-              }
-            }
-            break;
-          }
+        break;
+      }
         case UIMode::BAND: {
           if (band_edit_idx >= 0) {
             if (c >= '0' && c <= '9') { band_edit_buffer.push_back(c); draw_band_view(); }
@@ -3200,17 +2828,16 @@ static void app_task_core0(void* /*param*/) {
                 save_station_data();
                 draw_menu_view();
               } else if (c == '2') {
-                TxEntry e{};
-                e.dxcall = "FreeText";
-                e.field3 = g_free_text;
-                e.text = g_free_text;
-                e.snr = 0;
-                e.offset_hz = g_offset_hz;
+                // Send freetext - one-off transmission, bypass autoseq
                 int64_t now_slot = rtc_now_ms() / 15000;
-                e.slot_id = (int)((now_slot + 1) & 1); // next slot
-                e.repeat_counter = 1;
-                e.mark_delete = false;
-                enqueue_tx_with_preference(e, false);
+                g_pending_tx.text = g_free_text;
+                g_pending_tx.dxcall = "FreeText";
+                g_pending_tx.offset_hz = g_offset_hz;
+                g_pending_tx.slot_id = (int)((now_slot + 1) & 1); // next slot
+                g_pending_tx.repeat_counter = 1;
+                g_pending_tx.is_signoff = false;
+                g_pending_tx_valid = true;
+                schedule_tx_if_idle();
                 menu_flash_idx = 1; // absolute index of "Send FreeText"
                 menu_flash_deadline = rtc_now_ms() + 500;
                 draw_menu_view();
