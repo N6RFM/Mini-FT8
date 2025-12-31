@@ -393,16 +393,18 @@ static TxMsgType parse_rcvd_msg(QsoContext* ctx, const UiRxLine& msg) {
     std::string f3 = msg.field3;
     for (auto& ch : f3) ch = toupper((unsigned char)ch);
 
-    if (looks_like_grid(f3)) {
+    // Check specific keywords FIRST before grid pattern
+    // (RR73 matches grid pattern AA00 but is actually TX4!)
+    if (f3 == "RR73" || f3 == "RRR") {
+        rcvd = TxMsgType::TX4;
+    } else if (f3 == "73") {
+        rcvd = TxMsgType::TX5;
+    } else if (looks_like_grid(f3)) {
         rcvd = TxMsgType::TX1;
         // Only update grid if we don't have one yet (preserve from initial exchange)
         if (ctx->dxgrid.empty()) {
             ctx->dxgrid = f3;
         }
-    } else if (f3 == "73") {
-        rcvd = TxMsgType::TX5;
-    } else if (f3 == "RR73" || f3 == "RRR") {
-        rcvd = TxMsgType::TX4;
     } else if (!f3.empty() && f3[0] == 'R' && f3.size() > 1) {
         // Check if it's R+report (TX3)
         int rpt = 0;
