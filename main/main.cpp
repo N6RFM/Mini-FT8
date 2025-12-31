@@ -1102,7 +1102,7 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
     for (size_t i = 0; i < total; ++i) {
       hist[mon->wf.mag[i]]++;
     }
-    uint64_t target = total / 4;  // 25th percentile to avoid signal bias
+    uint64_t target = total / 3;  // 33th percentile to avoid signal bias
     uint64_t accum = 0;
     int noise_scaled = 0;
     for (int v = 0; v < 256; ++v) {
@@ -1388,6 +1388,9 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
       // Signoff handling for inbound RR73/73
       if (is_rr73) {
         // They sent RR73 to us: enqueue our 73
+        for (auto it = tx_queue.begin(); it != tx_queue.end();) {
+          if (!it->mark_delete && it->dxcall == dx) it = tx_queue.erase(it); else ++it;
+        }
         TxEntry t73 = make_tx_entry(5, dx, rpt, l.slot_id ^ 1, l.offset_hz);
         t73.repeat_counter = 1;
         enqueue_tx_with_preference(t73, true);
