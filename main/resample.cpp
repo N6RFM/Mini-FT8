@@ -1,29 +1,9 @@
 #include "resample.h"
 #include <string.h>
-#include <math.h>
-
-// Pre-computed 32-tap FIR lowpass filter coefficients
-// Design: Parks-McClellan with Hamming window
-// Sample rate: 48kHz
-// Passband: 0-5.5kHz, Stopband: 6kHz+
-// Normalized cutoff: 5.5/24 = 0.229
-static const float fir_coeffs[FIR_TAPS] = {
-    -0.000273f,  0.000431f,  0.001489f,  0.002731f,
-     0.003259f,  0.002110f, -0.001579f, -0.007796f,
-    -0.014741f, -0.019461f, -0.018418f, -0.008530f,
-     0.011556f,  0.040735f,  0.075128f,  0.109161f,
-     0.136853f,  0.153241f,  0.155341f,  0.143162f,
-     0.118866f,  0.086153f,  0.049851f,  0.014892f,
-    -0.014195f, -0.034659f, -0.045301f, -0.046481f,
-    -0.039811f, -0.027827f, -0.013393f, -0.000000f
-};
-
-// Symmetric FIR filter - use full 32 taps
-// Coefficients sum to approximately 1.0 for unity gain
 
 void resample_init(resample_state_t* state) {
-    memset(state->history, 0, sizeof(state->history));
-    state->history_idx = 0;
+    // No-op - no filter state to initialize
+    (void)state;
 }
 
 int convert_24bit_stereo_to_mono_float(
@@ -57,52 +37,23 @@ int convert_24bit_stereo_to_mono_float(
     return num_stereo_samples;
 }
 
-// Apply FIR filter to a single sample and return filtered value
-static inline float fir_filter_sample(resample_state_t* state, float sample) {
-    // Add new sample to history
-    state->history[state->history_idx] = sample;
-
-    // Compute FIR output
-    float acc = 0.0f;
-    int idx = state->history_idx;
-
-    for (int i = 0; i < FIR_TAPS; i++) {
-        acc += fir_coeffs[i] * state->history[idx];
-        idx--;
-        if (idx < 0) {
-            idx = FIR_TAPS - 1;
-        }
-    }
-
-    // Advance history index
-    state->history_idx++;
-    if (state->history_idx >= FIR_TAPS) {
-        state->history_idx = 0;
-    }
-
-    return acc;
-}
-
 int resample_48k_to_12k(
     resample_state_t* state,
     const float* in,
     float* out,
     int in_samples
 ) {
+    (void)state;  // Unused - no filter state needed
+
     int out_samples = in_samples / RESAMPLE_FACTOR;
-    int out_idx = 0;
 
-    for (int i = 0; i < in_samples; i++) {
-        // Apply anti-aliasing filter to every input sample
-        float filtered = fir_filter_sample(state, in[i]);
-
-        // Decimate: keep every RESAMPLE_FACTOR-th sample
-        if ((i + 1) % RESAMPLE_FACTOR == 0) {
-            out[out_idx++] = filtered;
-        }
+    // Simple decimation: take every RESAMPLE_FACTOR-th sample
+    // No anti-aliasing filter needed - input is already bandwidth-limited
+    for (int i = 0; i < out_samples; i++) {
+        out[i] = in[i * RESAMPLE_FACTOR];
     }
 
-    return out_idx;
+    return out_samples;
 }
 
 int uac_to_ft8_samples(
@@ -127,7 +78,7 @@ int uac_to_ft8_samples(
         // Step 1: Convert 24-bit stereo to mono float
         convert_24bit_stereo_to_mono_float(in_ptr, temp_mono, chunk);
 
-        // Step 2: Decimate 48kHz to 12kHz with anti-aliasing
+        // Step 2: Decimate 48kHz to 12kHz (no filtering needed)
         int out_count = resample_48k_to_12k(state, temp_mono, out_ptr, chunk);
 
         in_ptr += chunk * 6;  // 6 bytes per stereo sample

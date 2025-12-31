@@ -10,16 +10,12 @@ extern "C" {
 // Decimation factor: 48kHz -> 12kHz
 #define RESAMPLE_FACTOR 4
 
-// FIR filter length (taps)
-#define FIR_TAPS 32
-
-// Resampler state for maintaining filter history between calls
+// Resampler state (minimal - no filter history needed)
 typedef struct {
-    float history[FIR_TAPS];  // Filter delay line
-    int history_idx;          // Current position in delay line
+    int _unused;  // Placeholder for API compatibility
 } resample_state_t;
 
-// Initialize resampler state
+// Initialize resampler state (no-op, kept for API compatibility)
 void resample_init(resample_state_t* state);
 
 // Convert 24-bit stereo samples to mono float
@@ -32,7 +28,7 @@ int convert_24bit_stereo_to_mono_float(
     int num_stereo_samples  // Number of stereo sample pairs
 );
 
-// Decimate 48kHz mono float samples to 12kHz with anti-aliasing
+// Decimate 48kHz mono float samples to 12kHz (simple decimation, no filtering)
 // Input: 48kHz mono float samples
 // Output: 12kHz mono float samples
 // Returns: Number of output samples written (in_samples / RESAMPLE_FACTOR)
