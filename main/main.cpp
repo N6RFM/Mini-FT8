@@ -1452,10 +1452,10 @@ static void schedule_tx_if_idle() {
   int64_t slot_ms = now_ms % 15000;
   int now_parity = (int)(now_slot & 1);
 
-  // Ask autoseq to tick (may schedule TX internally)
-  autoseq_tick(now_slot, now_parity, (int)(15000 - slot_ms));
+  // NOTE: Don't call autoseq_tick here! Tick is for retry management and
+  // should only be called AFTER TX completes. Here we just fetch current next_tx.
 
-  // Try to fetch pending TX from autoseq
+  // Try to fetch pending TX from autoseq (reads current state, doesn't modify)
   AutoseqTxEntry pending;
   if (!autoseq_fetch_pending_tx(pending)) {
     s_tx_task_handle = NULL;
@@ -1583,6 +1583,14 @@ static void tx_send_task(void* param) {
   // Record slot index for spacing and notify autoseq
   s_last_tx_slot_idx = ctx->slot_idx;
   autoseq_mark_sent(ctx->slot_idx);
+
+  // Call tick to set up retry for next attempt (in case no response comes)
+  // This is like the reference architecture where tick is called at slot boundary after TX
+  // If a response comes, autoseq_on_decodes will update state and overwrite next_tx
+  int64_t now_ms = rtc_now_ms();
+  int64_t now_slot = now_ms / 15000;
+  int now_parity = (int)(now_slot & 1);
+  autoseq_tick(now_slot, now_parity, 0);
 
   g_pending_tx_valid = false;
   redraw_tx_view();

@@ -139,15 +139,16 @@ void autoseq_on_decodes(const std::vector<UiRxLine>& to_me_messages) {
     sort_and_clean();
 }
 
+// Called AFTER TX completes to set up retry for next attempt
+// This is the reference architecture - tick is for retry management, not scheduling
 void autoseq_tick(int64_t slot_idx, int slot_parity, int ms_to_boundary) {
-    // Don't tick if already have pending TX
-    if (s_pending_valid) return;
+    (void)slot_idx; (void)slot_parity; (void)ms_to_boundary;  // unused for now
 
     if (s_queue_size == 0) return;
 
     QsoContext* ctx = &s_queue[0];
 
-    // Advance retry counter or timeout
+    // Advance retry counter or timeout - sets up NEXT TX attempt
     switch (ctx->state) {
         case AutoseqState::REPLYING:
             if (ctx->retry_counter < ctx->retry_limit) {
@@ -196,59 +197,63 @@ void autoseq_tick(int64_t slot_idx, int slot_parity, int ms_to_boundary) {
 
     if (ctx->state == AutoseqState::IDLE) {
         pop_front();
-        // Recurse to process next in queue
-        if (s_queue_size > 0) {
-            autoseq_tick(slot_idx, slot_parity, ms_to_boundary);
-        }
-        return;
     }
 
-    // Schedule TX if slot parity matches
-    if ((ctx->slot_id & 1) != slot_parity) {
-        return;
-    }
-
-    // Enforce gap when switching slot parities
-    bool enforce_gap = (s_last_tx_parity != -1 &&
-                        s_last_tx_parity != slot_parity &&
-                        slot_idx == s_last_tx_slot_idx + 1);
-    if (enforce_gap) {
-        return;
-    }
-
-    // Format and schedule TX
-    std::string tx_text;
-    format_tx_text(ctx, ctx->next_tx, tx_text);
-    if (!tx_text.empty()) {
-        s_pending.text = tx_text;
-        s_pending.dxcall = ctx->dxcall;
-        s_pending.offset_hz = ctx->offset_hz;
-        s_pending.slot_id = ctx->slot_id;
-        s_pending.repeat_counter = ctx->retry_limit - ctx->retry_counter + 1;
-        s_pending.is_signoff = (ctx->next_tx == TxMsgType::TX4 ||
-                                ctx->next_tx == TxMsgType::TX5);
-        s_pending_valid = true;
-        s_pending_ctx_idx = 0;
-
-        ESP_LOGI(TAG, "Scheduled TX: %s (retry %d/%d)",
-                 tx_text.c_str(), ctx->retry_counter, ctx->retry_limit);
-    }
+    ESP_LOGI(TAG, "Tick: queue_size=%d, state=%d, next_tx=%d, retry=%d/%d",
+             s_queue_size, s_queue_size > 0 ? (int)s_queue[0].state : -1,
+             s_queue_size > 0 ? (int)s_queue[0].next_tx : -1,
+             s_queue_size > 0 ? s_queue[0].retry_counter : 0,
+             s_queue_size > 0 ? s_queue[0].retry_limit : 0);
 }
 
+// Get the next TX message text based on current state (does NOT modify state)
+// Returns true if there's a TX ready, false otherwise
+bool autoseq_get_next_tx(std::string& out_text) {
+    out_text.clear();
+
+    if (s_queue_size == 0) return false;
+
+    QsoContext* ctx = &s_queue[0];
+    if (ctx->state == AutoseqState::IDLE || ctx->next_tx == TxMsgType::TX_UNDEF) {
+        return false;
+    }
+
+    format_tx_text(ctx, ctx->next_tx, out_text);
+    return !out_text.empty();
+}
+
+// Get the pending TX entry - populates from current context state
+// Does NOT modify state - just reads current next_tx
 bool autoseq_fetch_pending_tx(AutoseqTxEntry& out) {
-    if (!s_pending_valid) return false;
-    out = s_pending;
-    // Don't clear yet - wait for mark_sent
+    if (s_queue_size == 0) return false;
+
+    QsoContext* ctx = &s_queue[0];
+    if (ctx->state == AutoseqState::IDLE || ctx->next_tx == TxMsgType::TX_UNDEF) {
+        return false;
+    }
+
+    std::string tx_text;
+    format_tx_text(ctx, ctx->next_tx, tx_text);
+    if (tx_text.empty()) return false;
+
+    out.text = tx_text;
+    out.dxcall = ctx->dxcall;
+    out.offset_hz = ctx->offset_hz;
+    out.slot_id = ctx->slot_id;
+    out.repeat_counter = ctx->retry_limit - ctx->retry_counter;
+    out.is_signoff = (ctx->next_tx == TxMsgType::TX4 ||
+                      ctx->next_tx == TxMsgType::TX5);
+
+    ESP_LOGI(TAG, "Fetch TX: %s (state=%d, next_tx=%d)",
+             tx_text.c_str(), (int)ctx->state, (int)ctx->next_tx);
     return true;
 }
 
 void autoseq_mark_sent(int64_t slot_idx) {
-    if (!s_pending_valid || s_pending_ctx_idx < 0) return;
+    if (s_queue_size == 0) return;
 
     s_last_tx_slot_idx = slot_idx;
-    s_last_tx_parity = s_pending.slot_id & 1;
-    s_pending_valid = false;
-    s_pending_ctx_idx = -1;
+    s_last_tx_parity = s_queue[0].slot_id & 1;
 
     ESP_LOGI(TAG, "TX sent on slot %lld", slot_idx);
 }

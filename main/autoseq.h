@@ -85,14 +85,17 @@ void autoseq_on_touch(const UiRxLine& msg);
 // Automatic response: process all decoded messages addressed to us
 void autoseq_on_decodes(const std::vector<UiRxLine>& to_me_messages);
 
-// TX scheduling tick - call each slot boundary
-// Returns true if there's a TX ready to send
+// TX retry tick - call AFTER TX completes to set up retry
+// This advances retry counter and sets next_tx for the next attempt
 void autoseq_tick(int64_t slot_idx, int slot_parity, int ms_to_boundary);
 
-// Fetch pending TX if scheduled (clears pending flag)
+// Get next TX text based on current state (does NOT modify state)
+bool autoseq_get_next_tx(std::string& out_text);
+
+// Fetch pending TX entry based on current state (does NOT modify state)
 bool autoseq_fetch_pending_tx(AutoseqTxEntry& out);
 
-// Mark TX as sent (decrements repeat counter, removes if done)
+// Mark TX as sent (called after transmission completes)
 void autoseq_mark_sent(int64_t slot_idx);
 
 // Get display strings for active QSOs
