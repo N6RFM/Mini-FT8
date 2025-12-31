@@ -1298,11 +1298,12 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
     autoseq_on_decodes(to_me);
 
     // Update last reply text to avoid re-processing
-    if (!to_me.empty()) {
-      g_last_reply_text = to_me.front().text;
-    }
+    g_last_reply_text = to_me.front().text;
+  }
 
-    // Schedule TX if idle
+  // Always try to schedule TX after decode - handles both responses and retries
+  // This is the main trigger for TX scheduling after the decode window closes
+  if (autoseq_has_active_qso()) {
     schedule_tx_if_idle();
   }
 
@@ -1586,7 +1587,8 @@ static void tx_send_task(void* param) {
   g_pending_tx_valid = false;
   redraw_tx_view();
   s_tx_task_handle = NULL;
-  schedule_tx_if_idle();
+  // NOTE: Don't call schedule_tx_if_idle here - wait for decode window to close first!
+  // The decode handler will schedule next TX after processing responses.
   vTaskDelete(NULL);
 }
 
