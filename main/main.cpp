@@ -434,6 +434,8 @@ static void log_rxtx_line(char dir, int snr, int offset_hz, const std::string& t
             dir, ts, freq_mhz, text.c_str(), snr, offset_hz);
   }
   fclose(f);
+  // Beacon always starts OFF after load
+  g_beacon = BeaconMode::OFF;
 }
 
 static void qso_load_file_list() {
@@ -543,7 +545,25 @@ static void log_adif_entry(const std::string& dxcall, const std::string& dxgrid,
   char freq_str[16];
   snprintf(freq_str, sizeof(freq_str), "%.3f", freq_mhz);
 
-  std::string comment_expanded = expand_comment1();
+  std::string comment_expanded = g_comment1;
+  auto repl = [](std::string& s, const std::string& from, const std::string& to) {
+    size_t pos = 0;
+    while ((pos = s.find(from, pos)) != std::string::npos) {
+      s.replace(pos, from.size(), to);
+      pos += to.size();
+    }
+  };
+  // Expand placeholders using current radio/ant strings
+  auto radio_name_local = [](RadioType r) {
+    switch (r) {
+      case RadioType::TRUSDX: return "TRUSDX";
+      case RadioType::QMX: return "QMX";
+      case RadioType::KH1: return "KH1";
+      default: return "None";
+    }
+  };
+  repl(comment_expanded, "/Radio", radio_name_local(g_radio));
+  repl(comment_expanded, "/Ant", g_ant);
   fprintf(f, "<call:%zu>%s <gridsquare:%zu>%s <mode:3>FT8<qso_date:8>%s <time_on:6>%s <freq:%zu>%s <station_callsign:%zu>%s <my_gridsquare:%zu>%s <rst_sent:%d>%d <rst_rcvd:%d>%d <comment:%zu>%s <eor>\n",
           dxcall.size(), dxcall.c_str(),
           dxgrid.size(), dxgrid.c_str(),
@@ -2411,7 +2431,7 @@ static void load_station_data() {
         g_bands[idx].freq = val;
       }
     } else if (sscanf(line, "beacon=%d", &val) == 1) {
-      if (val >= 0 && val <= 4) g_beacon = (BeaconMode)val;
+      // beacon persists OFF only; ignore saved value
     } else if (sscanf(line, "offset=%d", &val) == 1) {
       g_offset_hz = val;
     } else if (sscanf(line, "band_sel=%d", &val) == 1) {
@@ -2462,7 +2482,7 @@ static void save_station_data() {
   for (size_t i = 0; i < g_bands.size(); ++i) {
     fprintf(f, "band%u=%d\n", (unsigned)i, g_bands[i].freq);
   }
-  fprintf(f, "beacon=%d\n", (int)g_beacon);
+  // Beacon is not persisted (stays OFF on reload)
   fprintf(f, "offset=%d\n", g_offset_hz);
   fprintf(f, "band_sel=%d\n", g_band_sel);
   fprintf(f, "date=%s\n", g_date.c_str());
