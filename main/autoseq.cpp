@@ -389,7 +389,9 @@ static void format_tx_text(const QsoContext* ctx, TxMsgType id, std::string& out
 
 static TxMsgType parse_rcvd_msg(QsoContext* ctx, const UiRxLine& msg) {
     TxMsgType rcvd = TxMsgType::TX_UNDEF;
-    const std::string& f3 = msg.field3;
+    // Normalize field3 to uppercase for comparison
+    std::string f3 = msg.field3;
+    for (auto& ch : f3) ch = toupper((unsigned char)ch);
 
     if (looks_like_grid(f3)) {
         rcvd = TxMsgType::TX1;
@@ -401,7 +403,7 @@ static TxMsgType parse_rcvd_msg(QsoContext* ctx, const UiRxLine& msg) {
         rcvd = TxMsgType::TX5;
     } else if (f3 == "RR73" || f3 == "RRR") {
         rcvd = TxMsgType::TX4;
-    } else if (!f3.empty() && (f3[0] == 'R' || f3[0] == 'r') && f3.size() > 1) {
+    } else if (!f3.empty() && f3[0] == 'R' && f3.size() > 1) {
         // Check if it's R+report (TX3)
         int rpt = 0;
         if (looks_like_report(f3.substr(1), rpt)) {
@@ -623,8 +625,8 @@ static int compare_ctx(const void* a, const void* b) {
     }
 
     // Higher state value wins (more advanced in QSO)
-    // DESCENDING order: ROGERS(4) > ROGER_REPORT(3) > REPORT(2) > REPLYING(1) > CALLING(0)
-    // Exception: IDLE(6) and SIGNOFF(5) should be at the end to be processed/popped
+    // DESCENDING order: IDLE(6) > SIGNOFF(5) > ROGERS(4) > ROGER_REPORT(3) > ...
+    // IDLE at front gets popped; more advanced QSOs processed first
     if (left->state > right->state) return -1;  // Higher state comes first
     if (left->state < right->state) return 1;
     return 0;
