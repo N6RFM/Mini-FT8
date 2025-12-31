@@ -234,7 +234,8 @@ static std::vector<UiRxLine> g_rx_lines;
 int64_t g_decode_slot_idx = -1; // set at decode trigger to tag RX lines with slot parity
 static const char* STATION_FILE = "/spiffs/StationData.ini";
 
-enum class BeaconMode { OFF = 0, EVEN, EVEN2, ODD, ODD2 };
+//enum class BeaconMode { OFF = 0, EVEN, EVEN2, ODD, ODD2 };
+enum class BeaconMode { OFF = 0, EVEN, ODD };
 struct BandItem {
   const char* name;
   int freq;
@@ -785,9 +786,9 @@ static const char* beacon_name(BeaconMode m) {
   switch (m) {
     case BeaconMode::OFF: return "OFF";
     case BeaconMode::EVEN: return "EVEN";
-    case BeaconMode::EVEN2: return "EVEN2";
+    //case BeaconMode::EVEN2: return "EVEN2";
     case BeaconMode::ODD: return "ODD";
-    case BeaconMode::ODD2: return "ODD2";
+    //case BeaconMode::ODD2: return "ODD2";
   }
   return "OFF";
 }
@@ -1600,8 +1601,8 @@ static void maybe_enqueue_beacon() {
   switch (g_beacon) {
     case BeaconMode::EVEN:   target_parity = 0; allow = (parity == 0); break;
     case BeaconMode::ODD:    target_parity = 1; allow = (parity == 1); break;
-    case BeaconMode::EVEN2:  target_parity = 0; allow = (parity == 0) && (now_slot >= last_beacon_slot + 2); break;
-    case BeaconMode::ODD2:   target_parity = 1; allow = (parity == 1) && (now_slot >= last_beacon_slot + 2); break;
+    //case BeaconMode::EVEN2:  target_parity = 0; allow = (parity == 0) && (now_slot >= last_beacon_slot + 2); break;
+    //case BeaconMode::ODD2:   target_parity = 1; allow = (parity == 1) && (now_slot >= last_beacon_slot + 2); break;
     default: break;
   }
   if (!allow) return;
