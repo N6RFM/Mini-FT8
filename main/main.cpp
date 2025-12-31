@@ -543,6 +543,7 @@ static void log_adif_entry(const std::string& dxcall, const std::string& dxgrid,
   char freq_str[16];
   snprintf(freq_str, sizeof(freq_str), "%.3f", freq_mhz);
 
+  std::string comment_expanded = expand_comment1();
   fprintf(f, "<call:%zu>%s <gridsquare:%zu>%s <mode:3>FT8<qso_date:8>%s <time_on:6>%s <freq:%zu>%s <station_callsign:%zu>%s <my_gridsquare:%zu>%s <rst_sent:%d>%d <rst_rcvd:%d>%d <comment:%zu>%s <eor>\n",
           dxcall.size(), dxcall.c_str(),
           dxgrid.size(), dxgrid.c_str(),
@@ -552,7 +553,7 @@ static void log_adif_entry(const std::string& dxcall, const std::string& dxgrid,
           g_grid.size(), g_grid.c_str(),
           rst_sent == -99 ? 1 : (int)snprintf(nullptr,0,"%d",rst_sent), rst_sent,
           rst_rcvd == -99 ? 1 : (int)snprintf(nullptr,0,"%d",rst_rcvd), rst_rcvd,
-          g_comment1.size(), g_comment1.c_str());
+          comment_expanded.size(), comment_expanded.c_str());
   fclose(f);
 }
 
