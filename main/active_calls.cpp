@@ -67,7 +67,9 @@ ActiveCall* active_calls_touch(const std::string& dxcall,
         c->rpt_snr = rpt_snr;
         is_new = true;
     }
-    c->dxgrid = dxgrid;
+    if (!dxgrid.empty() || is_new) {
+        c->dxgrid = dxgrid;
+    }
     c->rx_snr = rx_snr;
     c->offset_hz = offset_hz;
     c->slot_id = slot_id;

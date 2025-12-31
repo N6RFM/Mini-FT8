@@ -434,8 +434,6 @@ static void log_rxtx_line(char dir, int snr, int offset_hz, const std::string& t
             dir, ts, freq_mhz, text.c_str(), snr, offset_hz);
   }
   fclose(f);
-  // Beacon always starts OFF after load
-  g_beacon = BeaconMode::OFF;
 }
 
 static void qso_load_file_list() {
@@ -1351,10 +1349,19 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
       else if (looks_like_report(f3, parsed)) seq = 2;
       else if (is_rr73) seq = 4;
       else if (is_73) seq = 5;
-      ActiveCall* ac = active_calls_touch(!l.field2.empty() ? l.field2 : l.field1,
-                         l.field3, l.snr, rpt, l.offset_hz, l.slot_id, seq, is_rr73 || is_73);
-
       std::string dx = !l.field2.empty() ? l.field2 : l.field1;
+      ActiveCall* existing = active_calls_find(dx);
+      std::string dxgrid_arg;
+      if (looks_like_grid(f3)) {
+        dxgrid_arg = f3;
+      } else if (existing) {
+        dxgrid_arg = existing->dxgrid;
+      } else {
+        dxgrid_arg.clear();
+      }
+      ActiveCall* ac = active_calls_touch(dx,
+                         dxgrid_arg, l.snr, rpt, l.offset_hz, l.slot_id, seq, is_rr73 || is_73);
+
       if (!dx.empty() && step > 0) {
         TxEntry te = make_tx_entry(step, dx, rpt, l.slot_id ^ 1, l.offset_hz);
         // Replace current tx_next immediately and enqueue for tracking
@@ -2471,6 +2478,7 @@ static void load_station_data() {
   fclose(f);
   rtc_set_from_strings();
   rebuild_active_bands();
+  g_beacon = BeaconMode::OFF; // force off on load
 }
 
 static void save_station_data() {
@@ -2537,18 +2545,18 @@ static void enter_mode(UIMode new_mode) {
     tx_commit_deletions();
   }
   if (ui_mode == UIMode::STATUS && new_mode != UIMode::STATUS) {
-    if (g_beacon != g_status_beacon_temp) {
-      g_beacon = g_status_beacon_temp;
-      save_station_data();
-      if (g_beacon == BeaconMode::OFF) {
-        // Abort any pending beacon TX and clear next
-        tx_next = TxEntry{};
-        tx_next_idx = -1;
-      }
+  if (g_beacon != g_status_beacon_temp) {
+    g_beacon = g_status_beacon_temp;
+    save_station_data();
+    if (g_beacon == BeaconMode::OFF) {
+      // Abort any pending beacon TX and clear next
+      tx_next = TxEntry{};
+      tx_next_idx = -1;
     }
-    status_edit_idx = -1;
-    status_edit_buffer.clear();
   }
+  status_edit_idx = -1;
+  status_edit_buffer.clear();
+}
   ui_mode = new_mode;
   rx_flash_idx = -1;
   switch (ui_mode) {
@@ -2851,7 +2859,9 @@ static void app_task_core0(void* /*param*/) {
               TxEntry te = make_tx_entry(start_step, dx, g_rx_lines[sel].snr, g_rx_lines[sel].slot_id ^ 1, g_rx_lines[sel].offset_hz);
               enqueue_tx_with_preference(te, false);
               // Start active call at TX6 (we initiated), rpt_snr unknown
-              active_calls_touch(dx, te.field3, g_rx_lines[sel].snr, -99, g_rx_lines[sel].offset_hz, g_rx_lines[sel].slot_id, 6, false);
+              std::string dxgrid_init;
+              if (looks_like_grid(g_rx_lines[sel].field3)) dxgrid_init = g_rx_lines[sel].field3;
+              active_calls_touch(dx, dxgrid_init, g_rx_lines[sel].snr, -99, g_rx_lines[sel].offset_hz, g_rx_lines[sel].slot_id, 6, false);
             }
             rx_flash_idx = sel;
             rx_flash_deadline = rtc_now_ms() + 500;
