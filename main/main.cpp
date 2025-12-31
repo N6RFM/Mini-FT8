@@ -381,6 +381,7 @@ static std::string g_last_reply_text;
 static void rebuild_active_bands();
 static void schedule_tx_if_idle();
 static int64_t last_beacon_slot = -1000;
+static int64_t s_last_tx_slot_idx = -1000;  // Track last TX slot for retry scheduling
 static bool g_sync_pending = false;
 static int g_sync_delta_ms = 0;
 static void maybe_enqueue_beacon();
@@ -1299,12 +1300,19 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
 
     // Update last reply text to avoid re-processing
     g_last_reply_text = to_me.front().text;
-  }
 
-  // Always try to schedule TX after decode - handles both responses and retries
-  // This is the main trigger for TX scheduling after the decode window closes
-  if (autoseq_has_active_qso()) {
-    schedule_tx_if_idle();
+    // Schedule TX only when we have actual responses that update state
+    if (autoseq_has_active_qso()) {
+      schedule_tx_if_idle();
+    }
+  } else if (autoseq_has_active_qso()) {
+    // No to_me messages, but we have an active QSO - might need to retry
+    // Only schedule retry if this decode is from a DIFFERENT slot than our last TX
+    // This ensures we don't schedule retry before decodes for our TX slot arrive
+    // (g_decode_slot_idx is set by stream_uac before calling decode_monitor_results)
+    if (g_decode_slot_idx > s_last_tx_slot_idx) {
+      schedule_tx_if_idle();
+    }
   }
 
   std::vector<UiRxLine> merged;
@@ -1430,7 +1438,6 @@ struct TxTaskContext {
 };
 
 static void tx_send_task(void* param);
-static int64_t s_last_tx_slot_idx = -1000;
 
 static void schedule_tx_if_idle() {
   // Use critical section to atomically check and set task handle
@@ -1567,7 +1574,7 @@ static void tx_send_task(void* param) {
   }
 
   for (int i = start_tone; i < 79; ++i) {
-    ESP_LOGI("TXTONE", "%02d %u", i, (unsigned)tones[i]);
+    ESP_LOGD("TXTONE", "%02d %u", i, (unsigned)tones[i]);
     fft_waterfall_tx_tone(tones[i]);
     if (cat_ok) {
       float tone_hz = base_hz + 6.25f * tones[i];
@@ -1939,7 +1946,7 @@ static void host_handle_line(const std::string& line_in) {
 }
 
 static void host_process_bytes(const uint8_t* buf, size_t len) {
-  ESP_LOGI(TAG, "host_process_bytes len=%u", (unsigned)len);
+  ESP_LOGD(TAG, "host_process_bytes len=%u", (unsigned)len);
   for (size_t i = 0; i < len; ) {
     if (host_bin_active) {
       // Skip any stray CR/LF before first payload byte

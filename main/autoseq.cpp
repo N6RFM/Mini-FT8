@@ -601,6 +601,17 @@ static void on_decode(const UiRxLine& msg) {
         }
     }
 
+    // Check message type before creating new context
+    // Don't create context for signoff messages (RR73/73) - these are late
+    // messages from completed QSOs
+    std::string f3 = msg.field3;
+    for (auto& ch : f3) ch = toupper((unsigned char)ch);
+    if (f3 == "RR73" || f3 == "RRR" || f3 == "73") {
+        ESP_LOGW(TAG, "on_decode: ignoring late signoff from %s (no active ctx)",
+                 dxcall.c_str());
+        return;
+    }
+
     ESP_LOGW(TAG, "on_decode: NO ctx found for %s, creating new (queue_size=%d)",
              dxcall.c_str(), s_queue_size);
 
