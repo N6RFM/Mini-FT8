@@ -95,13 +95,14 @@ void autoseq_on_touch(const UiRxLine& msg) {
 
     QsoContext* ctx = append_ctx();
 
-    // Determine the DX callsign from the message
+    // Determine the DX callsign from the message (normalize to uppercase)
     std::string dxcall;
     if (!msg.field2.empty()) {
         dxcall = msg.field2;  // field2 is the sender
     } else if (!msg.field1.empty() && msg.field1 != "CQ") {
         dxcall = msg.field1;
     }
+    for (auto& ch : dxcall) ch = toupper((unsigned char)ch);
 
     // Check if it's addressed to me
     std::string f1_upper = msg.field1;
@@ -133,10 +134,18 @@ void autoseq_on_touch(const UiRxLine& msg) {
 }
 
 void autoseq_on_decodes(const std::vector<UiRxLine>& to_me_messages) {
+    ESP_LOGI(TAG, "on_decodes: %d messages, queue_size=%d",
+             (int)to_me_messages.size(), s_queue_size);
     for (const auto& msg : to_me_messages) {
+        ESP_LOGI(TAG, "  msg: %s %s %s snr=%d",
+                 msg.field1.c_str(), msg.field2.c_str(), msg.field3.c_str(), msg.snr);
         on_decode(msg);
     }
     sort_and_clean();
+    if (s_queue_size > 0) {
+        ESP_LOGI(TAG, "on_decodes done: queue[0] state=%d, next_tx=%d, dxcall=%s",
+                 (int)s_queue[0].state, (int)s_queue[0].next_tx, s_queue[0].dxcall.c_str());
+    }
 }
 
 // Called AFTER TX completes to set up retry for next attempt
@@ -435,9 +444,10 @@ static bool generate_response(QsoContext* ctx, const UiRxLine& msg, bool overrid
         ctx->snr_tx = msg.snr;
     }
 
-    // Get DX callsign from field2 (the sender)
+    // Get DX callsign from field2 (the sender), normalize to uppercase
     std::string dxcall = msg.field2;
     if (dxcall.empty()) dxcall = msg.field1;
+    for (auto& ch : dxcall) ch = toupper((unsigned char)ch);
 
     if (override) {
         ctx->dxcall = dxcall;
@@ -567,18 +577,28 @@ static void on_decode(const UiRxLine& msg) {
         return;
     }
 
-    // Get DX call from field2
+    // Get DX call from field2 (normalize to uppercase for comparison)
     std::string dxcall = msg.field2;
+    for (auto& ch : dxcall) ch = toupper((unsigned char)ch);
     if (dxcall.empty()) return;
 
-    // Check if it matches an existing context
+    // Check if it matches an existing context (case-insensitive)
     for (int i = 0; i < s_queue_size; ++i) {
         QsoContext* ctx = &s_queue[i];
-        if (ctx->dxcall == dxcall) {
+        std::string ctx_dxcall = ctx->dxcall;
+        for (auto& ch : ctx_dxcall) ch = toupper((unsigned char)ch);
+        if (ctx_dxcall == dxcall) {
+            ESP_LOGI(TAG, "on_decode: found ctx for %s, state=%d, next_tx=%d",
+                     dxcall.c_str(), (int)ctx->state, (int)ctx->next_tx);
             generate_response(ctx, msg, false);
+            ESP_LOGI(TAG, "on_decode: after response, state=%d, next_tx=%d",
+                     (int)ctx->state, (int)ctx->next_tx);
             return;
         }
     }
+
+    ESP_LOGW(TAG, "on_decode: NO ctx found for %s, creating new (queue_size=%d)",
+             dxcall.c_str(), s_queue_size);
 
     // No matching context - create new if queue not full
     if (s_queue_size >= AUTOSEQ_MAX_QUEUE) {
@@ -603,9 +623,10 @@ static int compare_ctx(const void* a, const void* b) {
     }
 
     // Higher state value wins (more advanced in QSO)
-    // But IDLE (highest enum value) should be first to be popped
-    if (left->state < right->state) return -1;
-    if (left->state > right->state) return 1;
+    // DESCENDING order: ROGERS(4) > ROGER_REPORT(3) > REPORT(2) > REPLYING(1) > CALLING(0)
+    // Exception: IDLE(6) and SIGNOFF(5) should be at the end to be processed/popped
+    if (left->state > right->state) return -1;  // Higher state comes first
+    if (left->state < right->state) return 1;
     return 0;
 }
 
