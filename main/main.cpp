@@ -1426,8 +1426,8 @@ static void maybe_enqueue_beacon() {
   if (!allow) return;
   if (now_slot == last_beacon_slot) return;
 
-  // Use autoseq to start CQ
-  autoseq_start_cq();
+  // Use autoseq to start CQ with correct slot parity
+  autoseq_start_cq(parity);
   g_tx_view_dirty = true;
   last_beacon_slot = now_slot;
   debug_log_line("Beacon CQ queued");
@@ -2238,13 +2238,10 @@ static void enter_mode(UIMode new_mode) {
   if (g_beacon != g_status_beacon_temp) {
     g_beacon = g_status_beacon_temp;
     save_station_data();
-    if (g_beacon == BeaconMode::OFF) {
-      // Abort any pending TX and clear autoseq
-      autoseq_clear();
-      g_pending_tx = AutoseqTxEntry{};
-      g_pending_tx_valid = false;
-      g_tx_view_dirty = true;
-    }
+    // No need to clear autoseq when beacon is turned off.
+    // Any CQ in queue will transmit once, then tick moves CALLING→IDLE.
+    // Since beacon is now off, maybe_enqueue_beacon() won't add new CQ.
+    g_tx_view_dirty = true;
   }
   status_edit_idx = -1;
   status_edit_buffer.clear();

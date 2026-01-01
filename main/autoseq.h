@@ -77,7 +77,8 @@ void autoseq_init();
 void autoseq_clear();
 
 // Start a CQ call (adds CQ to queue)
-void autoseq_start_cq();
+// slot_parity: 0 for even slots, 1 for odd slots
+void autoseq_start_cq(int slot_parity);
 
 // Manual response: user taps on a decoded message
 void autoseq_on_touch(const UiRxLine& msg);

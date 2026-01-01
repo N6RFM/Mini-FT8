@@ -66,7 +66,7 @@ void autoseq_clear() {
     autoseq_init();
 }
 
-void autoseq_start_cq() {
+void autoseq_start_cq(int slot_parity) {
     // Don't add duplicate CQ at bottom
     if (s_queue_size > 0 && s_queue_size < AUTOSEQ_MAX_QUEUE) {
         if (s_queue[s_queue_size - 1].state == AutoseqState::CALLING) {
@@ -82,9 +82,10 @@ void autoseq_start_cq() {
     ctx->dxgrid.clear();
     ctx->snr_tx = -99;
     ctx->snr_rx = -99;
+    ctx->slot_id = slot_parity;  // Use the specified slot parity
     set_state(ctx, AutoseqState::CALLING, TxMsgType::TX6, 0);
     // No sort needed - CQ always at bottom
-    ESP_LOGI(TAG, "Started CQ");
+    ESP_LOGI(TAG, "Started CQ on slot %d", slot_parity);
 }
 
 void autoseq_on_touch(const UiRxLine& msg) {
