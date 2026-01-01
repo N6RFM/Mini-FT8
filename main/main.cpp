@@ -269,6 +269,7 @@ static void host_handle_line(const std::string& line);
 // TX entry for display and scheduling (populated by autoseq)
 static AutoseqTxEntry g_pending_tx;
 static bool g_pending_tx_valid = false;
+static volatile bool g_tx_cancel_requested = false;
 static void host_process_bytes(const uint8_t* buf, size_t len);
 static void poll_host_uart();
 static void poll_ble_uart();
@@ -1566,6 +1567,15 @@ static void tx_send_task(void* param) {
   std::unique_ptr<TxTaskContext> ctx(reinterpret_cast<TxTaskContext*>(param));
   if (ctx->delay_ms > 0) vTaskDelay(pdMS_TO_TICKS(ctx->delay_ms));
 
+  if (g_tx_cancel_requested) {
+    g_pending_tx_valid = false;
+    g_tx_cancel_requested = false;
+    s_tx_task_handle = NULL;
+    schedule_tx_if_idle();
+    vTaskDelete(NULL);
+    return;
+  }
+
   const AutoseqTxEntry& e = ctx->e;
   if (e.text.empty()) {
     s_tx_task_handle = NULL;
@@ -1633,7 +1643,9 @@ static void tx_send_task(void* param) {
     send_ta(tone_hz);
   }
 
+  bool cancelled = false;
   for (int i = start_tone; i < 79; ++i) {
+    if (g_tx_cancel_requested) { cancelled = true; break; }
     ESP_LOGD("TXTONE", "%02d %u", i, (unsigned)tones[i]);
     fft_waterfall_tx_tone(tones[i]);
     if (cat_ok) {
@@ -1647,23 +1659,26 @@ static void tx_send_task(void* param) {
     cat_cdc_send(reinterpret_cast<const uint8_t*>(rx), strlen(rx), 200);
   }
 
-  // Record slot index for spacing and notify autoseq
-  s_last_tx_slot_idx = ctx->slot_idx;
-  autoseq_mark_sent(ctx->slot_idx);
+  if (!cancelled) {
+    // Record slot index for spacing and notify autoseq
+    s_last_tx_slot_idx = ctx->slot_idx;
+    autoseq_mark_sent(ctx->slot_idx);
 
-  // Call tick to set up retry for next attempt (in case no response comes)
-  // This is like the reference architecture where tick is called at slot boundary after TX
-  // If a response comes, autoseq_on_decodes will update state and overwrite next_tx
-  int64_t now_ms = rtc_now_ms();
-  int64_t now_slot = now_ms / 15000;
-  int now_parity = (int)(now_slot & 1);
-  autoseq_tick(now_slot, now_parity, 0);
+    // Call tick to set up retry for next attempt (in case no response comes)
+    int64_t now_ms = rtc_now_ms();
+    int64_t now_slot = now_ms / 15000;
+    int now_parity = (int)(now_slot & 1);
+    autoseq_tick(now_slot, now_parity, 0);
+  }
 
   g_pending_tx_valid = false;
+  g_tx_cancel_requested = false;
   g_tx_view_dirty = true;  // Request TX view refresh from main loop
   s_tx_task_handle = NULL;
-  // NOTE: Don't call schedule_tx_if_idle here - wait for decode window to close first!
-  // The decode handler will schedule next TX after processing responses.
+  if (cancelled) {
+    schedule_tx_if_idle();
+  }
+  // NOTE: Don't call schedule_tx_if_idle here on normal completion - wait for decode window.
   vTaskDelete(NULL);
 }
 
@@ -2495,6 +2510,21 @@ static void app_task_core0(void* /*param*/) {
     vTaskDelay(pdMS_TO_TICKS(10));
     continue;
   }
+
+    // Global TX cancel (Esc/` in RX/TX/Status when not editing)
+    if (c == '`' &&
+        (ui_mode == UIMode::RX || ui_mode == UIMode::TX || ui_mode == UIMode::STATUS) &&
+        status_edit_idx == -1) {
+      g_tx_cancel_requested = true;
+      if (cat_cdc_ready()) {
+        const char* rx = "RX;";
+        cat_cdc_send(reinterpret_cast<const uint8_t*>(rx), strlen(rx), 50);
+      }
+      debug_log_line("TX cancel requested");
+      last_key = c;
+      vTaskDelay(pdMS_TO_TICKS(10));
+      continue;
+    }
 
     if (c == 0) {
       if (g_rx_dirty && ui_mode == UIMode::RX) {
