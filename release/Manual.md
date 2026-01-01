@@ -1,4 +1,4 @@
-# Mini-FT8 v1.0 (M5 Cardputer / ESP32-S3)
+# Mini-FT8 v1.1 (M5 Cardputer / ESP32-S3)
 
 Offline FT8 transceiver with QMX USB audio (UAC) and CAT, auto-sequencing, beacon, logging, and menu-driven UI.
 
@@ -14,7 +14,8 @@ Flash size: 8MB. SPIFFS: 4MB at 0x190000. SPIFFS mount auto-formats on failure (
 2) Press `s` (Status) → press `2` (“Connect to /Radio”) to start UAC host.  
 3) **Then power on QMX**; otherwise the host won’t enumerate.  
 4) Time/Date: Status line 6 (UTC). RTC drives slot alignment and auto-sync.  
-5) Status line 3 cycles “ActiveBand” (from Menu page 3).  
+5) Status line 3 cycles “ActiveBand” (from Menu page 3).
+6) `Esc` to cancel a Tx (in r/t/s mode only)
 
 ## Modes & Keys
 - `r` RX (default): waterfall + decodes. `1-6` enqueue reply. `;`/`.` page list.
