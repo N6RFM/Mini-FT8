@@ -2445,6 +2445,10 @@ static void app_task_core0(void* /*param*/) {
         ui_draw_rx(rx_flash_idx);
         g_rx_dirty = false;
       }
+      if (ui_mode == UIMode::TX && g_tx_view_dirty) {
+        g_tx_view_dirty = false;
+        redraw_tx_view();
+      }
       ui_draw_waterfall_if_dirty();
       menu_flash_tick();
       rx_flash_tick();
@@ -2453,6 +2457,11 @@ static void app_task_core0(void* /*param*/) {
       continue;
     }
   if (c == last_key) {
+    // No new keypress - still need to refresh dirty views
+    if (ui_mode == UIMode::TX && g_tx_view_dirty) {
+      g_tx_view_dirty = false;
+      redraw_tx_view();
+    }
     ui_draw_waterfall_if_dirty();
     vTaskDelay(pdMS_TO_TICKS(10));
     continue;
