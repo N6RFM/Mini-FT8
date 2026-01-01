@@ -743,7 +743,11 @@ static void redraw_tx_view() {
 
   std::string next_line;
   if (g_pending_tx_valid && !g_pending_tx.text.empty()) {
+    // Use scheduled TX text if available
     next_line = g_pending_tx.text;
+  } else {
+    // Fall back to autoseq's next TX (for display when TX not yet scheduled)
+    autoseq_get_next_tx(next_line);
   }
 
   ui_draw_tx(next_line, qtext, tx_page, -1, marks, slots);
