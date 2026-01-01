@@ -2463,11 +2463,19 @@ static void app_task_core0(void* /*param*/) {
   menu_flash_tick();
   rx_flash_tick();
   apply_pending_sync();
-  // NOTE: Don't call schedule_tx_if_idle here! TX scheduling happens:
+
+  // Beacon mode: schedule TX when beacon is active and no QSO in progress
+  // This is safe because beacon only runs when there's no active QSO,
+  // so there's no decode race condition to worry about
+  if (g_beacon != BeaconMode::OFF && !autoseq_has_active_qso()) {
+    schedule_tx_if_idle();
+  }
+  // NOTE: Don't call schedule_tx_if_idle unconditionally here!
+  // For active QSOs, TX scheduling happens:
   // 1. After decode processing (decode_monitor_results)
   // 2. After user touch on decoded message
   // 3. After sending free text
-  // Calling it in the main loop causes a race condition where TX is
+  // Calling it during active QSO causes a race condition where TX is
   // scheduled before decodes update the state.
 
   static int last_status_uac = -1; // -1 forces a redraw on first entry
@@ -2606,7 +2614,7 @@ static void app_task_core0(void* /*param*/) {
         }
         case UIMode::STATUS: {
         if (status_edit_idx == -1) {
-          if (c == '1') { g_status_beacon_temp = (BeaconMode)(((int)g_status_beacon_temp + 1) % 5); draw_status_view(); }
+          if (c == '1') { g_status_beacon_temp = (BeaconMode)(((int)g_status_beacon_temp + 1) % 3); draw_status_view(); }
           else if (c == '2') {
             status_edit_idx = 1;
             draw_status_view();
