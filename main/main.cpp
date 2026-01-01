@@ -1695,9 +1695,9 @@ static void draw_menu_view() {
   else cq_line += cq_type_name(g_cq_type);
   lines.push_back(cq_line);
   lines.push_back("Send FreeText");
-  lines.push_back(std::string("F:") + head_trim(menu_edit_idx == 3 ? menu_edit_buf : g_free_text, 16));
-  lines.push_back(std::string("Call:") + elide_right(menu_edit_idx == 4 ? menu_edit_buf : g_call));
-  lines.push_back(std::string("Grid:") + elide_right(menu_edit_idx == 5 ? menu_edit_buf : g_grid));
+  lines.push_back(std::string("F:") + head_trim(g_free_text, 16));
+  lines.push_back(std::string("Call:") + elide_right(menu_edit_idx == 3 ? menu_edit_buf : g_call));
+  lines.push_back(std::string("Grid:") + elide_right(menu_edit_idx == 4 ? menu_edit_buf : g_grid));
   lines.push_back(std::string("Sleep:") + (M5.Power.isCharging() ? "press" : "USB?"));
 
   lines.push_back(std::string("Offset:") + offset_name(g_offset_src));
@@ -1707,8 +1707,8 @@ static void draw_menu_view() {
     lines.push_back(std::string("Cursor:") + std::to_string(g_offset_hz));
   }
   lines.push_back(std::string("Radio:") + radio_name(g_radio));
-  lines.push_back(std::string("Antenna:") + elide_right(menu_edit_idx == 8 ? menu_edit_buf : g_ant));
-  lines.push_back(std::string("C:") + head_trim(menu_edit_idx == 9 ? menu_edit_buf : expand_comment1(), 16));
+  lines.push_back(std::string("Antenna:") + elide_right(menu_edit_idx == 9 ? menu_edit_buf : g_ant));
+  lines.push_back(std::string("C:") + head_trim(expand_comment1(), 16));
   lines.push_back(battery_status_line());
 
   // Page 2 content (index 12+)
@@ -2939,18 +2939,12 @@ static void app_task_core0(void* /*param*/) {
               break;
             } else if (menu_edit_idx >= 0) {
               if (c == '\n' || c == '\r') {
-                int idx = menu_edit_idx % 6;
-                int page = menu_edit_idx / 6;
-                if (page == 0) {
-                  if (idx == 3) { g_free_text = menu_edit_buf; if (g_cq_type == CqType::CQFREETEXT) g_cq_freetext = g_free_text; }
-                  else if (idx == 4) g_call = menu_edit_buf;
-                  else if (idx == 5) g_grid = menu_edit_buf;
-                } else {
-                  if (idx == 1) {
-                    g_offset_hz = atoi(menu_edit_buf.c_str());
-                  } else if (idx == 2) g_ant = menu_edit_buf;
-                  else if (idx == 3) g_comment1 = menu_edit_buf;
-                }
+                // Absolute indices across pages
+                if (menu_edit_idx == 3) { g_call = menu_edit_buf; }
+                else if (menu_edit_idx == 4) { g_grid = menu_edit_buf; }
+                else if (menu_edit_idx == 7) { g_offset_hz = atoi(menu_edit_buf.c_str()); }
+                else if (menu_edit_idx == 9) { g_ant = menu_edit_buf; }
+                else if (menu_edit_idx == 10) { g_comment1 = menu_edit_buf; }
                 save_station_data();
                 menu_edit_idx = -1;
                 menu_edit_buf.clear();
@@ -3007,11 +3001,11 @@ static void app_task_core0(void* /*param*/) {
                 menu_long_backup = g_free_text;
                 draw_menu_view();
               } else if (c == '4') {
-                menu_edit_idx = 4;
+                menu_edit_idx = 3; // Call (line index 3)
                 menu_edit_buf = g_call;
                 draw_menu_view();
               } else if (c == '5') {
-                menu_edit_idx = 5;
+                menu_edit_idx = 4; // Grid (line index 4)
                 menu_edit_buf = g_grid;
                 draw_menu_view();
               } else if (c == '6') {
@@ -3031,7 +3025,7 @@ static void app_task_core0(void* /*param*/) {
                   save_station_data();
                   draw_menu_view();
                 } else if (c == '2') {
-                  menu_edit_idx = 6 + 1; // Cursor
+                  menu_edit_idx = 7; // Cursor line
                   menu_edit_buf = std::to_string(g_offset_hz);
                   draw_menu_view();
                 } else if (c == '3') {
@@ -3039,7 +3033,7 @@ static void app_task_core0(void* /*param*/) {
                   save_station_data();
                   draw_menu_view();
                 } else if (c == '4') {
-                  menu_edit_idx = 6 + 2;
+                  menu_edit_idx = 9; // Antenna line
                   menu_edit_buf = g_ant;
                   draw_menu_view();
                 } else if (c == '5') {
