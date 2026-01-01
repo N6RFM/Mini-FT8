@@ -1446,6 +1446,59 @@ struct TxTaskContext {
 
 static void tx_send_task(void* param);
 
+static bool autoseq_has_pending_tx() {
+  AutoseqTxEntry tmp;
+  return autoseq_fetch_pending_tx(tmp);
+}
+
+// Schedule a one-off pending TX (e.g., manual FreeText) without touching autoseq state.
+// Returns false if a TX task is already running or if scheduling failed.
+static bool schedule_manual_pending_tx(const AutoseqTxEntry& pending) {
+  // Try to reserve the TX task slot
+  taskENTER_CRITICAL(&mux);
+  if (s_tx_task_handle != NULL) {
+    taskEXIT_CRITICAL(&mux);
+    return false;
+  }
+  s_tx_task_handle = (TaskHandle_t)1; // sentinel
+  taskEXIT_CRITICAL(&mux);
+
+  int64_t now_ms = rtc_now_ms();
+  int64_t now_slot = now_ms / 15000;
+  int64_t slot_ms = now_ms % 15000;
+  int now_parity = (int)(now_slot & 1);
+
+  int target_parity = pending.slot_id & 1;
+  bool can_inline = (target_parity == now_parity) && (slot_ms < 4000) && (now_slot >= s_last_tx_slot_idx + 2);
+
+  int64_t slot_idx = now_slot;
+  int64_t delay_ms = 0;
+  int skip_tones = 0;
+  if (can_inline) {
+    skip_tones = (int)(slot_ms / 160);
+    if (skip_tones >= 79) {
+      s_tx_task_handle = NULL;
+      return false;
+    }
+  } else {
+    if (slot_ms != 0) slot_idx += 1;
+    if (slot_idx <= s_last_tx_slot_idx + 1) {
+      slot_idx = s_last_tx_slot_idx + 2;
+    }
+    while ((slot_idx & 1) != target_parity) {
+      slot_idx += 1;
+    }
+    delay_ms = slot_idx * 15000 - now_ms;
+  }
+
+  g_pending_tx = pending;
+  g_pending_tx_valid = true;
+
+  auto* ctx = new TxTaskContext{pending, (int)delay_ms, slot_idx, skip_tones};
+  xTaskCreatePinnedToCore(tx_send_task, "tx_sched", 4096, ctx, 5, &s_tx_task_handle, 0);
+  return true;
+}
+
 static void schedule_tx_if_idle() {
   // Use critical section to atomically check and set task handle
   taskENTER_CRITICAL(&mux);
@@ -2900,19 +2953,23 @@ static void app_task_core0(void* /*param*/) {
                 draw_menu_view();
               } else if (c == '2') {
                 // Send freetext - one-off transmission, bypass autoseq
-                int64_t now_slot = rtc_now_ms() / 15000;
-                g_pending_tx.text = g_free_text;
-                g_pending_tx.dxcall = "FreeText";
-                g_pending_tx.offset_hz = g_offset_hz;
-                g_pending_tx.slot_id = (int)((now_slot + 1) & 1); // next slot
-                g_pending_tx.repeat_counter = 1;
-                g_pending_tx.is_signoff = false;
-                g_pending_tx_valid = true;
-                schedule_tx_if_idle();
-                menu_flash_idx = 1; // absolute index of "Send FreeText"
-                menu_flash_deadline = rtc_now_ms() + 500;
-                draw_menu_view();
-                debug_log_line(std::string("Queued: ") + g_free_text);
+                // If autoseq already has pending TX, ignore to avoid races
+                if (!autoseq_has_pending_tx()) {
+                  int64_t now_slot = rtc_now_ms() / 15000;
+                  AutoseqTxEntry ft{};
+                  ft.text = g_free_text;
+                  ft.dxcall = "FreeText";
+                  ft.offset_hz = g_offset_hz;
+                  ft.slot_id = (int)((now_slot + 1) & 1); // next slot
+                  ft.repeat_counter = 1;
+                  ft.is_signoff = false;
+                  if (schedule_manual_pending_tx(ft)) {
+                    menu_flash_idx = 1; // absolute index of "Send FreeText"
+                    menu_flash_deadline = rtc_now_ms() + 500;
+                    draw_menu_view();
+                    debug_log_line(std::string("Queued: ") + g_free_text);
+                  }
+                }
               } else if (c == '3') {
                 menu_long_edit = true;
                 menu_long_kind = LONG_FT;
