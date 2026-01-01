@@ -2453,6 +2453,10 @@ static void app_task_core0(void* /*param*/) {
         g_tx_view_dirty = false;
         redraw_tx_view();
       }
+      // Beacon mode: schedule TX when beacon is active and no QSO in progress
+      if (g_beacon != BeaconMode::OFF && !autoseq_has_active_qso()) {
+        schedule_tx_if_idle();
+      }
       ui_draw_waterfall_if_dirty();
       menu_flash_tick();
       rx_flash_tick();
@@ -2461,10 +2465,14 @@ static void app_task_core0(void* /*param*/) {
       continue;
     }
   if (c == last_key) {
-    // No new keypress - still need to refresh dirty views
+    // No new keypress - still need to refresh dirty views and beacon scheduling
     if (ui_mode == UIMode::TX && g_tx_view_dirty) {
       g_tx_view_dirty = false;
       redraw_tx_view();
+    }
+    // Beacon mode: schedule TX when beacon is active and no QSO in progress
+    if (g_beacon != BeaconMode::OFF && !autoseq_has_active_qso()) {
+      schedule_tx_if_idle();
     }
     ui_draw_waterfall_if_dirty();
     vTaskDelay(pdMS_TO_TICKS(10));
