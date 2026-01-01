@@ -229,6 +229,7 @@ enum class UIMode { RX, TX, BAND, MENU, HOST, CONTROL, DEBUG, LIST, STATUS, QSO 
 static UIMode ui_mode = UIMode::RX;
 static int tx_page = 0;
 static std::vector<UiRxLine> g_rx_lines;
+static bool g_tx_view_dirty = false;  // Set when autoseq state changes
 int64_t g_decode_slot_idx = -1; // set at decode trigger to tag RX lines with slot parity
 static const char* STATION_FILE = "/spiffs/StationData.ini";
 
@@ -1297,6 +1298,7 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
   if (!to_me.empty()) {
     // Feed all to-me messages to autoseq
     autoseq_on_decodes(to_me);
+    g_tx_view_dirty = true;
 
     // Update last reply text to avoid re-processing
     g_last_reply_text = to_me.front().text;
@@ -1426,6 +1428,7 @@ static void maybe_enqueue_beacon() {
 
   // Use autoseq to start CQ
   autoseq_start_cq();
+  g_tx_view_dirty = true;
   last_beacon_slot = now_slot;
   debug_log_line("Beacon CQ queued");
 }
@@ -1600,7 +1603,7 @@ static void tx_send_task(void* param) {
   autoseq_tick(now_slot, now_parity, 0);
 
   g_pending_tx_valid = false;
-  redraw_tx_view();
+  g_tx_view_dirty = true;  // Request TX view refresh from main loop
   s_tx_task_handle = NULL;
   // NOTE: Don't call schedule_tx_if_idle here - wait for decode window to close first!
   // The decode handler will schedule next TX after processing responses.
@@ -2240,6 +2243,7 @@ static void enter_mode(UIMode new_mode) {
       autoseq_clear();
       g_pending_tx = AutoseqTxEntry{};
       g_pending_tx_valid = false;
+      g_tx_view_dirty = true;
     }
   }
   status_edit_idx = -1;
@@ -2478,6 +2482,12 @@ static void app_task_core0(void* /*param*/) {
   // Calling it during active QSO causes a race condition where TX is
   // scheduled before decodes update the state.
 
+  // Refresh TX view if autoseq state changed
+  if (ui_mode == UIMode::TX && g_tx_view_dirty) {
+    g_tx_view_dirty = false;
+    redraw_tx_view();
+  }
+
   static int last_status_uac = -1; // -1 forces a redraw on first entry
   int cur_uac = uac_is_streaming() ? 1 : 0;
   if (cur_uac && last_status_uac == 0) {
@@ -2560,6 +2570,7 @@ static void app_task_core0(void* /*param*/) {
         if (sel >= 0 && sel < (int)g_rx_lines.size()) {
           // User tapped on a decoded message - let autoseq handle it
           autoseq_on_touch(g_rx_lines[sel]);
+          g_tx_view_dirty = true;
           schedule_tx_if_idle();
           rx_flash_idx = sel;
           rx_flash_deadline = rtc_now_ms() + 500;
