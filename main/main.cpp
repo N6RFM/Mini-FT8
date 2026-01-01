@@ -2605,6 +2605,19 @@ static void app_task_core0(void* /*param*/) {
           if (tx_page > 0) { tx_page--; redraw_tx_view(); }
         } else if (c == '.') {
           if (start_idx + 5 < qso_count) { tx_page++; redraw_tx_view(); }
+        } else if (c >= '2' && c <= '6') {
+          int idx = start_idx + (c - '2');
+          if (autoseq_drop_index(idx)) {
+            g_pending_tx_valid = false;
+            redraw_tx_view();
+            schedule_tx_if_idle();
+          }
+        } else if (c == '1') {
+          if (autoseq_rotate_same_parity()) {
+            g_pending_tx_valid = false;
+            redraw_tx_view();
+            schedule_tx_if_idle();
+          }
         } else if (c == 'e' || c == 'E') {
           encode_and_log_pending_tx();
         }

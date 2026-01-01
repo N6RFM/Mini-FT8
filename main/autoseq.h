@@ -76,6 +76,13 @@ void autoseq_init();
 // Clear all active QSOs
 void autoseq_clear();
 
+// Drop a QSO by index (0-based in display order). Returns true if removed.
+bool autoseq_drop_index(int idx);
+
+// Rotate to the next QSO with the same slot parity as the current head.
+// Returns true if a rotation occurred.
+bool autoseq_rotate_same_parity();
+
 // Start a CQ call (adds CQ to queue)
 // slot_parity: 0 for even slots, 1 for odd slots
 void autoseq_start_cq(int slot_parity);

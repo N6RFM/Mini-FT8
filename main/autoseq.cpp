@@ -66,6 +66,34 @@ void autoseq_clear() {
     autoseq_init();
 }
 
+bool autoseq_drop_index(int idx) {
+    if (idx < 0 || idx >= s_queue_size) return false;
+    for (int i = idx; i + 1 < s_queue_size; ++i) {
+        s_queue[i] = s_queue[i + 1];
+    }
+    --s_queue_size;
+    return true;
+}
+
+bool autoseq_rotate_same_parity() {
+    if (s_queue_size < 2) return false;
+    int parity = s_queue[0].slot_id & 1;
+    int found = -1;
+    for (int i = 1; i < s_queue_size; ++i) {
+        if ((s_queue[i].slot_id & 1) == parity) {
+            found = i;
+            break;
+        }
+    }
+    if (found == -1) return false;
+    QsoContext tmp = s_queue[found];
+    for (int i = found; i > 0; --i) {
+        s_queue[i] = s_queue[i - 1];
+    }
+    s_queue[0] = tmp;
+    return true;
+}
+
 void autoseq_start_cq(int slot_parity) {
     // Don't add duplicate CQ at bottom
     if (s_queue_size > 0 && s_queue_size < AUTOSEQ_MAX_QUEUE) {
