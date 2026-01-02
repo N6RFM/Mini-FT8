@@ -249,6 +249,8 @@ static std::vector<int> g_active_band_indices;
 static int band_page = 0;
 static int band_edit_idx = -1;       // absolute index into g_bands
 static std::string band_edit_buffer; // text while editing
+static void update_autoseq_cq_type();
+static void update_autoseq_cq_type();
 static BeaconMode g_beacon = BeaconMode::OFF;
 static int g_offset_hz = 1500;
 static int g_band_sel = 1; // default 80m
@@ -1014,6 +1016,20 @@ static void rebuild_active_bands() {
     oss << band_number_from_name(g_bands[g_active_band_indices[i]].name);
   }
   g_active_band_text = oss.str();
+}
+
+static void update_autoseq_cq_type() {
+  AutoseqCqType t = AutoseqCqType::CQ;
+  switch (g_cq_type) {
+    case CqType::CQSOTA: t = AutoseqCqType::SOTA; break;
+    case CqType::CQPOTA: t = AutoseqCqType::POTA; break;
+    case CqType::CQQRP:  t = AutoseqCqType::QRP;  break;
+    case CqType::CQFD:   t = AutoseqCqType::FD;   break;
+    case CqType::CQFREETEXT: t = AutoseqCqType::FREETEXT; break;
+    default: t = AutoseqCqType::CQ; break;
+  }
+  const std::string& ft = (g_cq_type == CqType::CQFREETEXT) ? g_free_text : g_cq_freetext;
+  autoseq_set_cq_type(t, ft);
 }
 
 static void advance_active_band(int delta) {
@@ -2413,6 +2429,7 @@ static void app_task_core0(void* /*param*/) {
 
   ui_mode = UIMode::RX;
   load_station_data();
+  update_autoseq_cq_type();
 
   // Update autoseq with station info after loading
   autoseq_set_station(g_call, g_grid);
@@ -2909,6 +2926,7 @@ static void app_task_core0(void* /*param*/) {
                 if (menu_long_kind == LONG_FT) {
                   g_free_text = menu_long_buf;
                   if (g_cq_type == CqType::CQFREETEXT) g_cq_freetext = g_free_text;
+                  update_autoseq_cq_type();
                 } else if (menu_long_kind == LONG_COMMENT) {
                   g_comment1 = menu_long_buf;
                 } else if (menu_long_kind == LONG_ACTIVE) {
@@ -2973,7 +2991,9 @@ static void app_task_core0(void* /*param*/) {
         } else if (menu_page == 0) {
               if (c == '1') {
                 g_cq_type = (CqType)(((int)g_cq_type + 1) % 6);
+                if (g_cq_type == CqType::CQFREETEXT) g_cq_freetext = g_free_text;
                 save_station_data();
+                update_autoseq_cq_type();
                 draw_menu_view();
               } else if (c == '2') {
                 // Send freetext - one-off transmission, bypass autoseq
