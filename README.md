@@ -2,7 +2,7 @@
 ![First POTA Activation](IMG_6087.jpeg)
 
 ## Mini-FT8 Release Notice
-It currently supports QMX only, truSDX and KH1 support will come later.
+It currently supports QMX only.
 
 ### Thanks
   - DX-FT8 team: Barb (WB2CBA), Charley (W5BAA) and Paul (G8KIG)
