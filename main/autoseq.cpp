@@ -582,7 +582,8 @@ static bool generate_response(QsoContext* ctx, const UiRxLine& msg, bool overrid
                 case TxMsgType::TX4:
                 case TxMsgType::TX5:
                     log_qso_if_needed(ctx);
-                    set_state(ctx, AutoseqState::SIGNOFF, TxMsgType::TX_UNDEF, 0);
+                    // QSO complete - set IDLE so context is removed by sort_and_clean
+                    set_state(ctx, AutoseqState::IDLE, TxMsgType::TX_UNDEF, 0);
                     break;
                 default:
                     break;
