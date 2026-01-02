@@ -44,7 +44,7 @@ static void format_tx_text(const QsoContext* ctx, TxMsgType id, std::string& out
 static TxMsgType parse_rcvd_msg(QsoContext* ctx, const UiRxLine& msg);
 static bool generate_response(QsoContext* ctx, const UiRxLine& msg, bool override);
 static void on_decode(const UiRxLine& msg);
-static int compare_ctx(const void* a, const void* b);
+static bool compare_ctx(const QsoContext& left, const QsoContext& right);
 static void pop_front();
 static QsoContext* append_ctx();
 static void sort_and_clean();
@@ -666,25 +666,18 @@ static void on_decode(const UiRxLine& msg) {
              ctx->dxcall.c_str(), (int)ctx->state, (int)ctx->next_tx);
 }
 
-// Comparison for qsort: IDLE at top (to be popped), CALLING at bottom
-static int compare_ctx(const void* a, const void* b) {
-    const QsoContext* left = (const QsoContext*)a;
-    const QsoContext* right = (const QsoContext*)b;
-
+// Comparison for std::sort: IDLE at top (to be popped), CALLING at bottom
+// Returns true if left should come before right
+static bool compare_ctx(const QsoContext& left, const QsoContext& right) {
     // Same state? Lower retry count wins (gets priority)
-    if (left->state == right->state) {
-        // More retries = lower priority
-        if (left->retry_counter < right->retry_counter) return -1;
-        if (left->retry_counter > right->retry_counter) return 1;
-        return 0;
+    if (left.state == right.state) {
+        return left.retry_counter < right.retry_counter;
     }
 
     // Higher state value wins (more advanced in QSO)
     // DESCENDING order: IDLE(6) > SIGNOFF(5) > ROGERS(4) > ROGER_REPORT(3) > ...
     // IDLE at front gets popped; more advanced QSOs processed first
-    if (left->state > right->state) return -1;  // Higher state comes first
-    if (left->state < right->state) return 1;
-    return 0;
+    return left.state > right.state;  // Higher state comes first
 }
 
 static void pop_front() {
@@ -708,7 +701,9 @@ static QsoContext* append_ctx() {
 static void sort_and_clean() {
     if (s_queue_size == 0) return;
 
-    qsort(s_queue, s_queue_size, sizeof(QsoContext), compare_ctx);
+    // Use std::sort instead of qsort - qsort does byte-wise swap which
+    // corrupts std::string members in QsoContext
+    std::sort(s_queue, s_queue + s_queue_size, compare_ctx);
 
     // Pop IDLE entries from front
     while (s_queue_size > 0 && s_queue[0].state == AutoseqState::IDLE) {
