@@ -225,12 +225,10 @@ void autoseq_tick(int64_t slot_idx, int slot_parity, int ms_to_boundary) {
             }
             break;
         case AutoseqState::CALLING:  // CQ only once (controlled by beacon)
+        case AutoseqState::SIGNOFF:  // QSO complete, remove from queue
             ctx->state = AutoseqState::IDLE;
             ctx->next_tx = TxMsgType::TX_UNDEF;
             break;
-        case AutoseqState::SIGNOFF:  // Keep context for repeat RRR/RR73
-            ctx->next_tx = TxMsgType::TX_UNDEF;
-            break; // do not set IDLE; keep in queue
         default:
             break;
     }
