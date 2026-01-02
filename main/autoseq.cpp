@@ -225,10 +225,9 @@ void autoseq_tick(int64_t slot_idx, int slot_parity, int ms_to_boundary) {
             }
             break;
         case AutoseqState::CALLING:  // CQ only once (controlled by beacon)
-        case AutoseqState::SIGNOFF:  // 73 only once
-            ctx->state = AutoseqState::IDLE;
+        case AutoseqState::SIGNOFF:  // Keep context for repeat RRR/RR73
             ctx->next_tx = TxMsgType::TX_UNDEF;
-            break;
+            break; // do not set IDLE; keep in queue
         default:
             break;
     }
@@ -567,7 +566,7 @@ static bool generate_response(QsoContext* ctx, const UiRxLine& msg, bool overrid
                 case TxMsgType::TX4:
                 case TxMsgType::TX5:
                     log_qso_if_needed(ctx);
-                    set_state(ctx, AutoseqState::SIGNOFF, TxMsgType::TX5, 0);
+                    set_state(ctx, AutoseqState::SIGNOFF, TxMsgType::TX5, AUTOSEQ_MAX_RETRY);
                     return true;
                 default:
                     return false;
@@ -578,7 +577,7 @@ static bool generate_response(QsoContext* ctx, const UiRxLine& msg, bool overrid
                 case TxMsgType::TX4:
                 case TxMsgType::TX5:
                     log_qso_if_needed(ctx);
-                    set_state(ctx, AutoseqState::IDLE, TxMsgType::TX_UNDEF, 0);
+                    set_state(ctx, AutoseqState::SIGNOFF, TxMsgType::TX_UNDEF, 0);
                     break;
                 default:
                     break;
@@ -588,11 +587,14 @@ static bool generate_response(QsoContext* ctx, const UiRxLine& msg, bool overrid
         case AutoseqState::SIGNOFF:  // We sent TX5
             switch (rcvd) {
                 case TxMsgType::TX4:
-                    // They didn't get our 73, but already logged
-                    break;
+                case TxMsgType::TX5:
+                    // They didn't get our 73; send another
+                    set_state(ctx, AutoseqState::SIGNOFF, TxMsgType::TX5, AUTOSEQ_MAX_RETRY);
+                    log_qso_if_needed(ctx);
+                    return true;
                 default:
-                    set_state(ctx, AutoseqState::IDLE, TxMsgType::TX_UNDEF, 0);
-                    break;
+                    // Ignore other traffic; keep context for a bit
+                    return false;
             }
             return false;
 
