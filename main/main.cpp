@@ -948,9 +948,9 @@ static void update_countdown() {
     int64_t now = rtc_now_ms();
     if (now >= menu_flash_deadline) {
       menu_flash_idx = -1;
-    if (ui_mode == UIMode::MENU && !menu_long_edit && menu_edit_idx < 0) {
-      draw_menu_view();
-    }
+      if (ui_mode == UIMode::MENU && !menu_long_edit && menu_edit_idx < 0) {
+        draw_menu_view();
+      }
   }
 }
 
@@ -1678,7 +1678,7 @@ static void tx_send_task(void* param) {
   if (!cancelled) {
     // Record slot index for spacing and notify autoseq
     s_last_tx_slot_idx = ctx->slot_idx;
-    autoseq_mark_sent(ctx->slot_idx);
+    autoseq_mark_sent(ctx->slot_idx, e.is_signoff);
 
     // Call tick to set up retry for next attempt (in case no response comes)
     int64_t now_ms = rtc_now_ms();

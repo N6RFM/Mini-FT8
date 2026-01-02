@@ -287,11 +287,15 @@ bool autoseq_fetch_pending_tx(AutoseqTxEntry& out) {
     return true;
 }
 
-void autoseq_mark_sent(int64_t slot_idx) {
+void autoseq_mark_sent(int64_t slot_idx, bool sent_signoff) {
     if (s_queue_size == 0) return;
 
     s_last_tx_slot_idx = slot_idx;
     s_last_tx_parity = s_queue[0].slot_id & 1;
+
+    if (sent_signoff) {
+        log_qso_if_needed(&s_queue[0]);
+    }
 
     ESP_LOGI(TAG, "TX sent on slot %lld", slot_idx);
 }

@@ -104,7 +104,8 @@ bool autoseq_get_next_tx(std::string& out_text);
 bool autoseq_fetch_pending_tx(AutoseqTxEntry& out);
 
 // Mark TX as sent (called after transmission completes)
-void autoseq_mark_sent(int64_t slot_idx);
+// sent_signoff: true if TX was RR73/73 (TX4/TX5) so we can log completion even without further RX.
+void autoseq_mark_sent(int64_t slot_idx, bool sent_signoff);
 
 // Get display strings for active QSOs
 void autoseq_get_qso_states(std::vector<std::string>& out);
