@@ -40,7 +40,7 @@ static int s_last_tx_parity = -1;
 // ============== Forward declarations ==============
 
 static void set_state(QsoContext* ctx, AutoseqState s, TxMsgType first_tx, int limit);
-static void format_tx_text(const QsoContext* ctx, TxMsgType id, std::string& out);
+static void format_tx_text(QsoContext* ctx, TxMsgType id, std::string& out);
 static TxMsgType parse_rcvd_msg(QsoContext* ctx, const UiRxLine& msg);
 static bool generate_response(QsoContext* ctx, const UiRxLine& msg, bool override);
 static void on_decode(const UiRxLine& msg);
@@ -287,16 +287,13 @@ bool autoseq_fetch_pending_tx(AutoseqTxEntry& out) {
     return true;
 }
 
-void autoseq_mark_sent(int64_t slot_idx, bool sent_signoff) {
+void autoseq_mark_sent(int64_t slot_idx) {
     if (s_queue_size == 0) return;
 
     s_last_tx_slot_idx = slot_idx;
     s_last_tx_parity = s_queue[0].slot_id & 1;
 
-    if (sent_signoff) {
-        log_qso_if_needed(&s_queue[0]);
-    }
-
+    // Logging now happens in format_tx_text() when generating TX4/TX5
     ESP_LOGI(TAG, "TX sent on slot %lld", slot_idx);
 }
 
@@ -360,7 +357,7 @@ static void set_state(QsoContext* ctx, AutoseqState s, TxMsgType first_tx, int l
     ctx->retry_limit = limit;
 }
 
-static void format_tx_text(const QsoContext* ctx, TxMsgType id, std::string& out) {
+static void format_tx_text(QsoContext* ctx, TxMsgType id, std::string& out) {
     out.clear();
     if (!ctx || ctx->state == AutoseqState::IDLE) return;
 
@@ -389,12 +386,16 @@ static void format_tx_text(const QsoContext* ctx, TxMsgType id, std::string& out
             snprintf(buf, sizeof(buf), "%s %s RR73",
                      ctx->dxcall.c_str(), s_my_call.c_str());
             out = buf;
+            // Log QSO when generating RR73 (matches reference project)
+            log_qso_if_needed(ctx);
             break;
 
         case TxMsgType::TX5:
             snprintf(buf, sizeof(buf), "%s %s 73",
                      ctx->dxcall.c_str(), s_my_call.c_str());
             out = buf;
+            // Log QSO when generating 73 (matches reference project)
+            log_qso_if_needed(ctx);
             break;
 
         case TxMsgType::TX6: {
@@ -544,8 +545,7 @@ static bool generate_response(QsoContext* ctx, const UiRxLine& msg, bool overrid
                     return true;
                 case TxMsgType::TX4:
                 case TxMsgType::TX5:
-                    // QSO complete without full exchange
-                    log_qso_if_needed(ctx);
+                    // QSO complete without full exchange - logging happens in format_tx_text
                     set_state(ctx, AutoseqState::SIGNOFF, TxMsgType::TX5, 0);
                     return true;
                 default:
@@ -559,7 +559,7 @@ static bool generate_response(QsoContext* ctx, const UiRxLine& msg, bool overrid
                     return true;
                 case TxMsgType::TX4:
                 case TxMsgType::TX5:
-                    log_qso_if_needed(ctx);
+                    // Logging happens in format_tx_text when we generate TX5
                     set_state(ctx, AutoseqState::SIGNOFF, TxMsgType::TX5, 0);
                     return true;
                 default:
@@ -570,7 +570,7 @@ static bool generate_response(QsoContext* ctx, const UiRxLine& msg, bool overrid
             switch (rcvd) {
                 case TxMsgType::TX4:
                 case TxMsgType::TX5:
-                    log_qso_if_needed(ctx);
+                    // Logging happens in format_tx_text when we generate TX5
                     set_state(ctx, AutoseqState::SIGNOFF, TxMsgType::TX5, AUTOSEQ_MAX_RETRY);
                     return true;
                 default:
@@ -581,8 +581,7 @@ static bool generate_response(QsoContext* ctx, const UiRxLine& msg, bool overrid
             switch (rcvd) {
                 case TxMsgType::TX4:
                 case TxMsgType::TX5:
-                    log_qso_if_needed(ctx);
-                    // QSO complete - set IDLE so context is removed by sort_and_clean
+                    // Already logged when we generated TX4 - just mark complete
                     set_state(ctx, AutoseqState::IDLE, TxMsgType::TX_UNDEF, 0);
                     break;
                 default:
@@ -594,9 +593,8 @@ static bool generate_response(QsoContext* ctx, const UiRxLine& msg, bool overrid
             switch (rcvd) {
                 case TxMsgType::TX4:
                 case TxMsgType::TX5:
-                    // They didn't get our 73; send another
+                    // They didn't get our 73; send another (already logged when we sent TX5)
                     set_state(ctx, AutoseqState::SIGNOFF, TxMsgType::TX5, AUTOSEQ_MAX_RETRY);
-                    log_qso_if_needed(ctx);
                     return true;
                 default:
                     // Ignore other traffic; keep context for a bit

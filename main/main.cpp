@@ -1678,7 +1678,7 @@ static void tx_send_task(void* param) {
   if (!cancelled) {
     // Record slot index for spacing and notify autoseq
     s_last_tx_slot_idx = ctx->slot_idx;
-    autoseq_mark_sent(ctx->slot_idx, e.is_signoff);
+    autoseq_mark_sent(ctx->slot_idx);
 
     // Call tick to set up retry for next attempt (in case no response comes)
     int64_t now_ms = rtc_now_ms();
