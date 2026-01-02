@@ -474,7 +474,11 @@ static void log_qso_if_needed(QsoContext* ctx) {
 static bool generate_response(QsoContext* ctx, const UiRxLine& msg, bool override) {
     TxMsgType rcvd = parse_rcvd_msg(ctx, msg);
 
+    ESP_LOGI(TAG, "generate_response: override=%d, rcvd=%d, ctx->state=%d",
+             override, (int)rcvd, (int)ctx->state);
+
     if (rcvd == TxMsgType::TX_UNDEF) {
+        ESP_LOGW(TAG, "generate_response: rcvd=TX_UNDEF, returning false");
         return false;
     }
 
@@ -660,6 +664,8 @@ static void on_decode(const UiRxLine& msg) {
 
     QsoContext* ctx = append_ctx();
     generate_response(ctx, msg, true);
+    ESP_LOGI(TAG, "on_decode: NEW ctx %s, state=%d, next_tx=%d",
+             ctx->dxcall.c_str(), (int)ctx->state, (int)ctx->next_tx);
 }
 
 // Comparison for qsort: IDLE at top (to be popped), CALLING at bottom
