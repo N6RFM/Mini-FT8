@@ -8,6 +8,7 @@ It currently supports QMX only, truSDX and KH1 support will come later.
   - DX-FT8 team: Barb (WB2CBA), Charley (W5BAA) and Paul (G8KIG)
   - Zhenxing (N6HAN) — big help getting past obstacles (especially UAC)
   - Karlis Goba — ft8 library
+  - OpenAI and Anthropic for their incredible coding assistance
 
 ### Hardware
 (I have no affiliation with the vendor.)
