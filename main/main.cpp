@@ -1537,8 +1537,8 @@ static void schedule_tx_if_idle() {
   s_tx_task_handle = (TaskHandle_t)1;
   taskEXIT_CRITICAL(&mux);
 
-  // Try beacon first
-  maybe_enqueue_beacon();
+  // NOTE: Beacon CQ is enqueued in decode_monitor_results(), not here.
+  // This function just schedules whatever is in the autoseq queue.
 
   // Get timing info
   int64_t now_ms = rtc_now_ms();
