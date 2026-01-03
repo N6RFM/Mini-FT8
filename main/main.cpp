@@ -230,6 +230,8 @@ static UIMode ui_mode = UIMode::RX;
 static int tx_page = 0;
 static std::vector<UiRxLine> g_rx_lines;
 static bool g_tx_view_dirty = false;  // Set when autoseq state changes
+static bool g_auto_switch_to_tx = false;  // Auto-switch to TX screen when transmitting
+static bool g_auto_switch_to_rx = false;  // Auto-switch to RX screen when decodes arrive
 int64_t g_decode_slot_idx = -1; // set at decode trigger to tag RX lines with slot parity
 static const char* STATION_FILE = "/spiffs/StationData.ini";
 
@@ -1353,6 +1355,12 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
   if (merged.size() > 12) merged.resize(12);
 
   g_rx_lines = merged;
+
+  // Auto-switch to RX screen when decodes arrive
+  if (!merged.empty()) {
+    g_auto_switch_to_rx = true;
+  }
+
   if (update_ui) {
     ui_set_rx_list(g_rx_lines);
     ui_draw_rx();
@@ -1643,6 +1651,9 @@ static void tx_send_task(void* param) {
     cat_cdc_send(reinterpret_cast<const uint8_t*>(md), strlen(md), 200);
     cat_cdc_send(reinterpret_cast<const uint8_t*>(tx), strlen(tx), 200);
   }
+
+  // Auto-switch to TX screen when transmission starts
+  g_auto_switch_to_tx = true;
 
   int start_tone = ctx->skip_tones;
   if (start_tone >= 79) start_tone = 79;
@@ -2554,6 +2565,24 @@ static void app_task_core0(void* /*param*/) {
     }
 
     if (c == 0) {
+      // Auto-switch between RX and TX screens (only when in RX or TX mode)
+      if (g_auto_switch_to_tx && ui_mode == UIMode::RX) {
+        g_auto_switch_to_tx = false;
+        g_auto_switch_to_rx = false;  // Clear both to avoid ping-pong
+        enter_mode(UIMode::TX);
+        redraw_tx_view();
+      } else if (g_auto_switch_to_rx && ui_mode == UIMode::TX) {
+        g_auto_switch_to_rx = false;
+        g_auto_switch_to_tx = false;
+        enter_mode(UIMode::RX);
+        ui_force_redraw_rx();
+        ui_draw_rx();
+      } else {
+        // Clear flags if in other modes (don't interrupt MENU, BAND, etc.)
+        g_auto_switch_to_tx = false;
+        g_auto_switch_to_rx = false;
+      }
+
       if (g_rx_dirty && ui_mode == UIMode::RX) {
         ui_set_rx_list(g_rx_lines);
         ui_draw_rx(rx_flash_idx);
