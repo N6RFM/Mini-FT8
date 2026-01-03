@@ -1316,6 +1316,7 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
   }
 
   // Auto-sequencing for reply-to-me messages
+  // This follows the reference architecture: process decodes, then decide TX
   if (!to_me.empty()) {
     // Feed all to-me messages to autoseq
     autoseq_on_decodes(to_me);
@@ -1324,16 +1325,22 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
     // Update last reply text to avoid re-processing
     g_last_reply_text = to_me.front().text;
 
-    // Schedule TX only when we have actual responses that update state
-    if (autoseq_has_active_qso()) {
-      schedule_tx_if_idle();
-    }
+    // Schedule TX for QSO response
+    schedule_tx_if_idle();
   } else if (autoseq_has_active_qso()) {
     // No to_me messages, but we have an active QSO - might need to retry
     // Only schedule retry if this decode is from a DIFFERENT slot than our last TX
     // This ensures we don't schedule retry before decodes for our TX slot arrive
     // (g_decode_slot_idx is set by stream_uac before calling decode_monitor_results)
     if (g_decode_slot_idx > s_last_tx_slot_idx) {
+      schedule_tx_if_idle();
+    }
+  } else if (g_beacon != BeaconMode::OFF) {
+    // No to_me messages and no active QSO - check beacon mode
+    // This matches reference architecture: beacon CQ is added ONLY after
+    // decodes are processed and ONLY when nothing else to TX
+    maybe_enqueue_beacon();
+    if (autoseq_queue_size() > 0) {
       schedule_tx_if_idle();
     }
   }
@@ -1436,21 +1443,24 @@ static void maybe_enqueue_beacon() {
 
   int64_t now_ms = rtc_now_ms();
   int64_t now_slot = now_ms / 15000;
-  int parity = (int)(now_slot & 1);
+  int current_parity = (int)(now_slot & 1);
 
-  bool allow = false;
-  switch (g_beacon) {
-    case BeaconMode::EVEN: allow = (parity == 0); break;
-    case BeaconMode::ODD:  allow = (parity == 1); break;
-    default: break;
-  }
-  if (!allow) return;
-  if (now_slot == last_beacon_slot) return;
+  // Determine target TX parity based on beacon mode
+  int target_parity = (g_beacon == BeaconMode::EVEN) ? 0 : 1;
+
+  // Check if NEXT slot matches our target parity
+  // (decode happens during RX slot, we want to TX on the next appropriate slot)
+  int next_parity = current_parity ^ 1;
+  if (next_parity != target_parity) return;
+
+  // Prevent duplicate: check if we already queued for this TX slot
+  int64_t target_slot = now_slot + 1;
+  if (target_slot == last_beacon_slot) return;
 
   // Use autoseq to start CQ with correct slot parity
-  autoseq_start_cq(parity);
+  autoseq_start_cq(target_parity);
   g_tx_view_dirty = true;
-  last_beacon_slot = now_slot;
+  last_beacon_slot = target_slot;
   debug_log_line("Beacon CQ queued");
 }
 
@@ -2553,10 +2563,8 @@ static void app_task_core0(void* /*param*/) {
         g_tx_view_dirty = false;
         redraw_tx_view();
       }
-      // Beacon mode: schedule TX when beacon is active and no QSO in progress
-      if (g_beacon != BeaconMode::OFF && !autoseq_has_active_qso()) {
-        schedule_tx_if_idle();
-      }
+      // NOTE: Beacon scheduling moved to decode_monitor_results() to match
+      // reference architecture - beacon CQ is only added after decodes processed
       ui_draw_waterfall_if_dirty();
       menu_flash_tick();
       rx_flash_tick();
@@ -2565,15 +2573,12 @@ static void app_task_core0(void* /*param*/) {
       continue;
     }
   if (c == last_key) {
-    // No new keypress - still need to refresh dirty views and beacon scheduling
+    // No new keypress - still need to refresh dirty views
     if (ui_mode == UIMode::TX && g_tx_view_dirty) {
       g_tx_view_dirty = false;
       redraw_tx_view();
     }
-    // Beacon mode: schedule TX when beacon is active and no QSO in progress
-    if (g_beacon != BeaconMode::OFF && !autoseq_has_active_qso()) {
-      schedule_tx_if_idle();
-    }
+    // NOTE: Beacon scheduling moved to decode_monitor_results()
     ui_draw_waterfall_if_dirty();
     vTaskDelay(pdMS_TO_TICKS(10));
     continue;
@@ -2586,19 +2591,11 @@ static void app_task_core0(void* /*param*/) {
   rx_flash_tick();
   apply_pending_sync();
 
-  // Beacon mode: schedule TX when beacon is active and no QSO in progress
-  // This is safe because beacon only runs when there's no active QSO,
-  // so there's no decode race condition to worry about
-  if (g_beacon != BeaconMode::OFF && !autoseq_has_active_qso()) {
-    schedule_tx_if_idle();
-  }
-  // NOTE: Don't call schedule_tx_if_idle unconditionally here!
-  // For active QSOs, TX scheduling happens:
-  // 1. After decode processing (decode_monitor_results)
+  // NOTE: Beacon scheduling moved to decode_monitor_results() to match
+  // reference architecture. TX scheduling happens:
+  // 1. After decode processing (decode_monitor_results) - includes beacon
   // 2. After user touch on decoded message
   // 3. After sending free text
-  // Calling it during active QSO causes a race condition where TX is
-  // scheduled before decodes update the state.
 
   // Refresh TX view if autoseq state changed
   if (ui_mode == UIMode::TX && g_tx_view_dirty) {
