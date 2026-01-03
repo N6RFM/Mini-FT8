@@ -1445,6 +1445,7 @@ static bool looks_like_report(const std::string& s, int& out) {
   return true;
 }
 
+// Called from decode callback - schedules for NEXT slot (we're in RX slot)
 static void maybe_enqueue_beacon() {
   if (g_beacon == BeaconMode::OFF) return;
   if (autoseq_has_active_qso()) return;  // Don't beacon during active QSO
@@ -1470,6 +1471,32 @@ static void maybe_enqueue_beacon() {
   g_tx_view_dirty = true;
   last_beacon_slot = target_slot;
   debug_log_line("Beacon CQ queued");
+}
+
+// Called when beacon is enabled - always schedules for next TX slot
+// Handles initialization case where RX cycle is partial (no decode callback)
+// Duplicate scheduling is prevented by last_beacon_slot check in maybe_enqueue_beacon()
+static void beacon_on_enable() {
+  if (g_beacon == BeaconMode::OFF) return;
+  if (autoseq_has_active_qso()) return;
+
+  int64_t now_ms = rtc_now_ms();
+  int64_t now_slot = now_ms / 15000;
+  int target_parity = (g_beacon == BeaconMode::EVEN) ? 0 : 1;
+
+  // Find next slot matching target parity
+  int64_t target_slot = now_slot + 1;
+  if (((int)(target_slot & 1)) != target_parity) {
+    target_slot += 1;
+  }
+
+  if (target_slot == last_beacon_slot) return;
+
+  autoseq_start_cq(target_parity);
+  g_tx_view_dirty = true;
+  last_beacon_slot = target_slot;
+
+  schedule_tx_if_idle();
 }
 
 struct TxTaskContext {
@@ -2344,17 +2371,24 @@ static void init_soft_uart() {
 static void enter_mode(UIMode new_mode) {
   // No special handling needed when leaving TX mode - autoseq manages queue internally
   if (ui_mode == UIMode::STATUS && new_mode != UIMode::STATUS) {
-  if (g_beacon != g_status_beacon_temp) {
-    g_beacon = g_status_beacon_temp;
-    save_station_data();
-    // No need to clear autoseq when beacon is turned off.
-    // Any CQ in queue will transmit once, then tick moves CALLING→IDLE.
-    // Since beacon is now off, maybe_enqueue_beacon() won't add new CQ.
-    g_tx_view_dirty = true;
+    if (g_beacon != g_status_beacon_temp) {
+      bool was_off = (g_beacon == BeaconMode::OFF);
+      g_beacon = g_status_beacon_temp;
+      save_station_data();
+      // No need to clear autoseq when beacon is turned off.
+      // Any CQ in queue will transmit once, then tick moves CALLING→IDLE.
+      // Since beacon is now off, maybe_enqueue_beacon() won't add new CQ.
+      g_tx_view_dirty = true;
+
+      // If beacon was just enabled, schedule for next TX slot
+      // This handles partial RX cycle case (no decode callback)
+      if (was_off && g_beacon != BeaconMode::OFF) {
+        beacon_on_enable();
+      }
+    }
+    status_edit_idx = -1;
+    status_edit_buffer.clear();
   }
-  status_edit_idx = -1;
-  status_edit_buffer.clear();
-}
   ui_mode = new_mode;
   rx_flash_idx = -1;
   switch (ui_mode) {
