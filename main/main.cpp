@@ -358,7 +358,6 @@ static bool g_rxtx_log = true;
 static TaskHandle_t s_tx_task_handle = NULL;
 static portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
 static SemaphoreHandle_t log_mutex = NULL;                       // Protects log_rxtx_line file access
-static portMUX_TYPE beacon_mux = portMUX_INITIALIZER_UNLOCKED;   // Protects beacon scheduling
 static int menu_page = 0;
 static int menu_edit_idx = -1;
 static std::string menu_edit_buf;
@@ -388,11 +387,10 @@ static bool looks_like_report(const std::string& s, int& out);
 static std::string g_last_reply_text;
 static void rebuild_active_bands();
 static void schedule_tx_if_idle();
-static int64_t last_beacon_slot = -1000;
 static int64_t s_last_tx_slot_idx = -1000;  // Track last TX slot for retry scheduling
 static bool g_sync_pending = false;
 static int g_sync_delta_ms = 0;
-static void maybe_enqueue_beacon();
+static void enqueue_beacon_cq();
 static void qso_load_file_list();
 static void qso_load_entries(const std::string& path);
 
@@ -1341,8 +1339,14 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
     // Update last reply text to avoid re-processing
     g_last_reply_text = to_me.front().text;
 
-    // Schedule TX for QSO response
-    schedule_tx_if_idle();
+    // Schedule TX for QSO response (or beacon if QSO just completed)
+    if (autoseq_has_active_qso()) {
+      schedule_tx_if_idle();
+    } else if (g_beacon != BeaconMode::OFF) {
+      // QSO just completed (e.g., received 73), beacon takes over
+      enqueue_beacon_cq();
+      schedule_tx_if_idle();
+    }
   } else if (autoseq_has_active_qso()) {
     // No to_me messages, but we have an active QSO - might need to retry
     // Only schedule retry if this decode is from a DIFFERENT slot than our last TX
@@ -1352,13 +1356,9 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
       schedule_tx_if_idle();
     }
   } else if (g_beacon != BeaconMode::OFF) {
-    // No to_me messages and no active QSO - check beacon mode
-    // This matches reference architecture: beacon CQ is added ONLY after
-    // decodes are processed and ONLY when nothing else to TX
-    maybe_enqueue_beacon();
-    if (autoseq_queue_size() > 0) {
-      schedule_tx_if_idle();
-    }
+    // No to_me messages and no active QSO - beacon mode
+    enqueue_beacon_cq();
+    schedule_tx_if_idle();
   }
 
   std::vector<UiRxLine> merged;
@@ -1459,71 +1459,13 @@ static bool looks_like_report(const std::string& s, int& out) {
   return true;
 }
 
-// Called from decode callback - schedules for NEXT slot (we're in RX slot)
-static void maybe_enqueue_beacon() {
-  if (g_beacon == BeaconMode::OFF) return;
-  if (autoseq_has_active_qso()) return;  // Don't beacon during active QSO
-
-  int64_t now_ms = rtc_now_ms();
-  int64_t now_slot = now_ms / 15000;
-  int current_parity = (int)(now_slot & 1);
-
-  // Determine target TX parity based on beacon mode
+// Enqueue a beacon CQ. Parity is determined by beacon mode.
+// Duplicate prevention is handled by autoseq_start_cq().
+// Slot timing is handled by schedule_tx_if_idle().
+static void enqueue_beacon_cq() {
   int target_parity = (g_beacon == BeaconMode::EVEN) ? 0 : 1;
-
-  // Check if NEXT slot matches our target parity
-  // (decode happens during RX slot, we want to TX on the next appropriate slot)
-  int next_parity = current_parity ^ 1;
-  if (next_parity != target_parity) return;
-
-  // Prevent duplicate: check if we already queued for this TX slot
-  int64_t target_slot = now_slot + 1;
-
-  // Protect access to last_beacon_slot and autoseq_start_cq
-  taskENTER_CRITICAL(&beacon_mux);
-  if (target_slot == last_beacon_slot) {
-    taskEXIT_CRITICAL(&beacon_mux);
-    return;
-  }
-
-  // Use autoseq to start CQ with correct slot parity
   autoseq_start_cq(target_parity);
   g_tx_view_dirty = true;
-  last_beacon_slot = target_slot;
-  taskEXIT_CRITICAL(&beacon_mux);
-  debug_log_line("Beacon CQ queued");
-}
-
-// Called when beacon is enabled - always schedules for next TX slot
-// Handles initialization case where RX cycle is partial (no decode callback)
-// Duplicate scheduling is prevented by last_beacon_slot check in maybe_enqueue_beacon()
-static void beacon_on_enable() {
-  if (g_beacon == BeaconMode::OFF) return;
-  if (autoseq_has_active_qso()) return;
-
-  int64_t now_ms = rtc_now_ms();
-  int64_t now_slot = now_ms / 15000;
-  int target_parity = (g_beacon == BeaconMode::EVEN) ? 0 : 1;
-
-  // Find next slot matching target parity
-  int64_t target_slot = now_slot + 1;
-  if (((int)(target_slot & 1)) != target_parity) {
-    target_slot += 1;
-  }
-
-  // Protect access to last_beacon_slot and autoseq_start_cq
-  taskENTER_CRITICAL(&beacon_mux);
-  if (target_slot == last_beacon_slot) {
-    taskEXIT_CRITICAL(&beacon_mux);
-    return;
-  }
-
-  autoseq_start_cq(target_parity);
-  g_tx_view_dirty = true;
-  last_beacon_slot = target_slot;
-  taskEXIT_CRITICAL(&beacon_mux);
-
-  schedule_tx_if_idle();
 }
 
 struct TxTaskContext {
@@ -2404,13 +2346,13 @@ static void enter_mode(UIMode new_mode) {
       save_station_data();
       // No need to clear autoseq when beacon is turned off.
       // Any CQ in queue will transmit once, then tick moves CALLING→IDLE.
-      // Since beacon is now off, maybe_enqueue_beacon() won't add new CQ.
       g_tx_view_dirty = true;
 
-      // If beacon was just enabled, schedule for next TX slot
-      // This handles partial RX cycle case (no decode callback)
+      // If beacon was just enabled, enqueue CQ and schedule TX
+      // This handles partial RX cycle case (no decode callback yet)
       if (was_off && g_beacon != BeaconMode::OFF) {
-        beacon_on_enable();
+        enqueue_beacon_cq();
+        schedule_tx_if_idle();
       }
     }
     status_edit_idx = -1;
