@@ -233,6 +233,13 @@ static volatile bool g_tx_view_dirty = false;  // Set when autoseq state changes
 static volatile bool g_auto_switch_to_tx = false;  // Auto-switch to TX screen when transmitting
 static volatile bool g_auto_switch_to_rx = false;  // Auto-switch to RX screen when decodes arrive
 int64_t g_decode_slot_idx = -1; // set at decode trigger to tag RX lines with slot parity
+
+// State machine variables (matching reference project architecture)
+// TX is scheduled by setting these flags; actual TX starts at slot boundary
+static volatile bool g_qso_xmit = false;        // TX is pending
+static volatile int g_target_slot_parity = 0;   // 0=even, 1=odd - parity of slot to TX on
+static volatile bool g_was_txing = false;       // We were transmitting (for tick timing)
+static int64_t g_last_slot_idx = -1;            // For slot boundary detection
 static const char* STATION_FILE = "/spiffs/StationData.ini";
 
 //enum class BeaconMode { OFF = 0, EVEN, EVEN2, ODD, ODD2 };
@@ -957,6 +964,49 @@ static void update_countdown() {
   }
 }
 
+// Forward declaration for tx_start_immediate
+static void tx_start_immediate(int skip_tones);
+
+// Slot boundary check - called from main loop
+// Matches reference project: tick after TX slot ends, TX trigger at slot start
+static void check_slot_boundary() {
+  int64_t now_ms = rtc_now_ms();
+  int64_t slot_idx = now_ms / 15000;
+  int slot_ms = (int)(now_ms % 15000);
+  int slot_parity = (int)(slot_idx & 1);
+
+  // Detect slot boundary
+  if (slot_idx != g_last_slot_idx) {
+    g_last_slot_idx = slot_idx;
+
+    // If we were transmitting, call tick to pop the completed TX entry
+    if (g_was_txing) {
+      ESP_LOGI(TAG, "Slot boundary: was_txing, calling tick");
+      autoseq_tick(slot_idx, slot_parity, 0);
+      g_was_txing = false;
+      g_tx_view_dirty = true;
+    }
+  }
+
+  // TX trigger: check if we should start TX in this slot
+  // Conditions: qso_xmit flag set, correct parity, early enough in slot, not already TXing
+  if (g_qso_xmit &&
+      g_target_slot_parity == slot_parity &&
+      slot_ms < 4000 &&
+      s_tx_task_handle == NULL) {
+
+    ESP_LOGI(TAG, "TX trigger: starting TX in slot %lld (parity %d)",
+             (long long)slot_idx, slot_parity);
+
+    // Calculate skip_tones for partial slot
+    int skip_tones = slot_ms / 160;
+    if (skip_tones < 79) {
+      g_qso_xmit = false;  // Clear flag before starting TX
+      tx_start_immediate(skip_tones);
+    }
+  }
+}
+
   static void menu_flash_tick() {
     if (menu_flash_idx < 0) return;
     int64_t now = rtc_now_ms();
@@ -1329,36 +1379,40 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
     }
   }
 
-  // Auto-sequencing for reply-to-me messages
-  // This follows the reference architecture: process decodes, then decide TX
-  if (!to_me.empty()) {
-    // Feed all to-me messages to autoseq
-    autoseq_on_decodes(to_me);
-    g_tx_view_dirty = true;
+  // Auto-sequencing: matches reference architecture
+  // 1. Process decodes (only for to_me messages)
+  // 2. Check if TX ready, set flags
+  // 3. TX trigger happens at slot boundary in check_slot_boundary()
 
-    // Update last reply text to avoid re-processing
-    g_last_reply_text = to_me.front().text;
+  // Only process decodes when NOT transmitting (matches reference: if !was_txing)
+  if (!g_was_txing) {
+    if (!to_me.empty()) {
+      // Feed all to-me messages to autoseq
+      autoseq_on_decodes(to_me);
+      g_tx_view_dirty = true;
+      g_last_reply_text = to_me.front().text;
+    }
 
-    // Schedule TX for QSO response (or beacon if QSO just completed)
-    if (autoseq_has_active_qso()) {
-      schedule_tx_if_idle();
+    // Check if there's a TX ready from autoseq
+    AutoseqTxEntry pending;
+    if (autoseq_fetch_pending_tx(pending)) {
+      // TX is ready - set flags for slot boundary trigger
+      g_qso_xmit = true;
+      g_target_slot_parity = pending.slot_id & 1;
+      g_pending_tx = pending;
+      g_pending_tx_valid = true;
+      ESP_LOGI(TAG, "TX ready: %s parity=%d", pending.text.c_str(), g_target_slot_parity);
     } else if (g_beacon != BeaconMode::OFF) {
-      // QSO just completed (e.g., received 73), beacon takes over
+      // No TX ready, beacon on: add CQ and set flags
       enqueue_beacon_cq();
-      schedule_tx_if_idle();
+      if (autoseq_fetch_pending_tx(pending)) {
+        g_qso_xmit = true;
+        g_target_slot_parity = pending.slot_id & 1;
+        g_pending_tx = pending;
+        g_pending_tx_valid = true;
+        ESP_LOGI(TAG, "Beacon CQ ready: %s parity=%d", pending.text.c_str(), g_target_slot_parity);
+      }
     }
-  } else if (autoseq_has_active_qso()) {
-    // No to_me messages, but we have an active QSO - might need to retry
-    // Only schedule retry if this decode is from a DIFFERENT slot than our last TX
-    // This ensures we don't schedule retry before decodes for our TX slot arrive
-    // (g_decode_slot_idx is set by stream_uac before calling decode_monitor_results)
-    if (g_decode_slot_idx > s_last_tx_slot_idx) {
-      schedule_tx_if_idle();
-    }
-  } else if (g_beacon != BeaconMode::OFF) {
-    // No to_me messages and no active QSO - beacon mode
-    enqueue_beacon_cq();
-    schedule_tx_if_idle();
   }
 
   std::vector<UiRxLine> merged;
@@ -1461,7 +1515,7 @@ static bool looks_like_report(const std::string& s, int& out) {
 
 // Enqueue a beacon CQ. Parity is determined by beacon mode.
 // Duplicate prevention is handled by autoseq_start_cq().
-// Slot timing is handled by schedule_tx_if_idle().
+// TX trigger happens at slot boundary via check_slot_boundary().
 static void enqueue_beacon_cq() {
   int target_parity = (g_beacon == BeaconMode::EVEN) ? 0 : 1;
   autoseq_start_cq(target_parity);
@@ -1593,6 +1647,41 @@ static void schedule_tx_if_idle() {
   xTaskCreatePinnedToCore(tx_send_task, "tx_sched", 4096, ctx, 5, &s_tx_task_handle, 0);
 }
 
+// Start TX immediately (called from check_slot_boundary at the right time)
+// This is the simplified TX trigger matching reference architecture
+static void tx_start_immediate(int skip_tones) {
+  // Atomically check and set task handle
+  taskENTER_CRITICAL(&mux);
+  if (s_tx_task_handle != NULL) {
+    taskEXIT_CRITICAL(&mux);
+    return;
+  }
+  s_tx_task_handle = (TaskHandle_t)1;
+  taskEXIT_CRITICAL(&mux);
+
+  // Fetch pending TX from autoseq
+  AutoseqTxEntry pending;
+  if (!autoseq_fetch_pending_tx(pending)) {
+    s_tx_task_handle = NULL;
+    g_pending_tx_valid = false;
+    ESP_LOGW(TAG, "tx_start_immediate: no pending TX");
+    return;
+  }
+
+  g_pending_tx = pending;
+  g_pending_tx_valid = true;
+
+  // Get current slot info
+  int64_t now_ms = rtc_now_ms();
+  int64_t slot_idx = now_ms / 15000;
+
+  ESP_LOGI(TAG, "tx_start_immediate: TX=%s skip=%d slot=%lld",
+           pending.text.c_str(), skip_tones, (long long)slot_idx);
+
+  auto* ctx = new TxTaskContext{pending, 0, slot_idx, skip_tones};
+  xTaskCreatePinnedToCore(tx_send_task, "tx_imm", 4096, ctx, 5, &s_tx_task_handle, 0);
+}
+
 static void tx_send_task(void* param) {
   std::unique_ptr<TxTaskContext> ctx(reinterpret_cast<TxTaskContext*>(param));
   if (ctx->delay_ms > 0) vTaskDelay(pdMS_TO_TICKS(ctx->delay_ms));
@@ -1601,7 +1690,7 @@ static void tx_send_task(void* param) {
     g_pending_tx_valid = false;
     g_tx_cancel_requested = false;
     s_tx_task_handle = NULL;
-    schedule_tx_if_idle();
+    // TX decision will be re-evaluated after next decode
     vTaskDelete(NULL);
     return;
   }
@@ -1609,7 +1698,7 @@ static void tx_send_task(void* param) {
   const AutoseqTxEntry& e = ctx->e;
   if (e.text.empty()) {
     s_tx_task_handle = NULL;
-    schedule_tx_if_idle();
+    // TX decision will be re-evaluated after next decode
     vTaskDelete(NULL);
     return;
   }
@@ -1696,22 +1785,16 @@ static void tx_send_task(void* param) {
     // Record slot index for spacing and notify autoseq
     s_last_tx_slot_idx = ctx->slot_idx;
     autoseq_mark_sent(ctx->slot_idx);
-
-    // Call tick to set up retry for next attempt (in case no response comes)
-    int64_t now_ms = rtc_now_ms();
-    int64_t now_slot = now_ms / 15000;
-    int now_parity = (int)(now_slot & 1);
-    autoseq_tick(now_slot, now_parity, 0);
+    // Set was_txing flag - autoseq_tick will be called at slot boundary
+    g_was_txing = true;
   }
 
   g_pending_tx_valid = false;
   g_tx_cancel_requested = false;
   g_tx_view_dirty = true;  // Request TX view refresh from main loop
   s_tx_task_handle = NULL;
-  if (cancelled) {
-    schedule_tx_if_idle();
-  }
-  // NOTE: Don't call schedule_tx_if_idle here on normal completion - wait for decode window.
+  // Note: Don't call schedule_tx_if_idle or autoseq_tick here
+  // TX decision happens after decode, tick happens at slot boundary
   vTaskDelete(NULL);
 }
 
@@ -2348,11 +2431,17 @@ static void enter_mode(UIMode new_mode) {
       // Any CQ in queue will transmit once, then tick moves CALLING→IDLE.
       g_tx_view_dirty = true;
 
-      // If beacon was just enabled, enqueue CQ and schedule TX
-      // This handles partial RX cycle case (no decode callback yet)
+      // If beacon was just enabled, enqueue CQ and set TX flag
+      // TX will trigger at next slot boundary via check_slot_boundary()
       if (was_off && g_beacon != BeaconMode::OFF) {
         enqueue_beacon_cq();
-        schedule_tx_if_idle();
+        AutoseqTxEntry pending;
+        if (autoseq_fetch_pending_tx(pending)) {
+          g_qso_xmit = true;
+          g_target_slot_parity = pending.slot_id & 1;
+          g_pending_tx = pending;
+          g_pending_tx_valid = true;
+        }
       }
     }
     status_edit_idx = -1;
@@ -2491,6 +2580,7 @@ static void app_task_core0(void* /*param*/) {
 
     rtc_tick();
     update_countdown();
+    check_slot_boundary();  // TX trigger at slot boundary (matching reference architecture)
 
   // HOST mode: UAC audio streaming - update status display
   if (ui_mode == UIMode::HOST) {
@@ -2623,15 +2713,15 @@ static void app_task_core0(void* /*param*/) {
 
   rtc_tick();
   update_countdown();
+  check_slot_boundary();  // TX trigger at slot boundary (matching reference architecture)
   menu_flash_tick();
   rx_flash_tick();
   apply_pending_sync();
 
-  // NOTE: Beacon scheduling moved to decode_monitor_results() to match
-  // reference architecture. TX scheduling happens:
-  // 1. After decode processing (decode_monitor_results) - includes beacon
-  // 2. After user touch on decoded message
-  // 3. After sending free text
+  // NOTE: TX scheduling now follows reference architecture:
+  // 1. decode_monitor_results() sets g_qso_xmit flag after processing
+  // 2. check_slot_boundary() triggers TX at slot boundary when parity matches
+  // 3. autoseq_tick() is called at slot boundary AFTER TX slot ends
 
   // Refresh TX view if autoseq state changed
   if (ui_mode == UIMode::TX && g_tx_view_dirty) {
@@ -2722,7 +2812,14 @@ static void app_task_core0(void* /*param*/) {
           // User tapped on a decoded message - let autoseq handle it
           autoseq_on_touch(g_rx_lines[sel]);
           g_tx_view_dirty = true;
-          schedule_tx_if_idle();
+          // Set TX flags - actual TX at slot boundary
+          AutoseqTxEntry pending;
+          if (autoseq_fetch_pending_tx(pending)) {
+            g_qso_xmit = true;
+            g_target_slot_parity = pending.slot_id & 1;
+            g_pending_tx = pending;
+            g_pending_tx_valid = true;
+          }
           rx_flash_idx = sel;
           rx_flash_deadline = rtc_now_ms() + 500;
           ui_draw_rx(rx_flash_idx);
@@ -2743,13 +2840,27 @@ static void app_task_core0(void* /*param*/) {
           if (autoseq_drop_index(idx)) {
             g_pending_tx_valid = false;
             redraw_tx_view();
-            schedule_tx_if_idle();
+            // Re-evaluate TX after queue change
+            AutoseqTxEntry pending;
+            if (autoseq_fetch_pending_tx(pending)) {
+              g_qso_xmit = true;
+              g_target_slot_parity = pending.slot_id & 1;
+              g_pending_tx = pending;
+              g_pending_tx_valid = true;
+            }
           }
         } else if (c == '1') {
           if (autoseq_rotate_same_parity()) {
             g_pending_tx_valid = false;
             redraw_tx_view();
-            schedule_tx_if_idle();
+            // Re-evaluate TX after queue change
+            AutoseqTxEntry pending;
+            if (autoseq_fetch_pending_tx(pending)) {
+              g_qso_xmit = true;
+              g_target_slot_parity = pending.slot_id & 1;
+              g_pending_tx = pending;
+              g_pending_tx_valid = true;
+            }
           }
         } else if (c == 'e' || c == 'E') {
           encode_and_log_pending_tx();
