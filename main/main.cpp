@@ -229,9 +229,9 @@ enum class UIMode { RX, TX, BAND, MENU, HOST, CONTROL, DEBUG, LIST, STATUS, QSO 
 static UIMode ui_mode = UIMode::RX;
 static int tx_page = 0;
 static std::vector<UiRxLine> g_rx_lines;
-static bool g_tx_view_dirty = false;  // Set when autoseq state changes
-static bool g_auto_switch_to_tx = false;  // Auto-switch to TX screen when transmitting
-static bool g_auto_switch_to_rx = false;  // Auto-switch to RX screen when decodes arrive
+static volatile bool g_tx_view_dirty = false;  // Set when autoseq state changes
+static volatile bool g_auto_switch_to_tx = false;  // Auto-switch to TX screen when transmitting
+static volatile bool g_auto_switch_to_rx = false;  // Auto-switch to RX screen when decodes arrive
 int64_t g_decode_slot_idx = -1; // set at decode trigger to tag RX lines with slot parity
 static const char* STATION_FILE = "/spiffs/StationData.ini";
 
@@ -357,6 +357,8 @@ static std::string g_comment1 = "MiniFT8 /Radio /Ant";
 static bool g_rxtx_log = true;
 static TaskHandle_t s_tx_task_handle = NULL;
 static portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
+static SemaphoreHandle_t log_mutex = NULL;                       // Protects log_rxtx_line file access
+static portMUX_TYPE beacon_mux = portMUX_INITIALIZER_UNLOCKED;   // Protects beacon scheduling
 static int menu_page = 0;
 static int menu_edit_idx = -1;
 static std::string menu_edit_buf;
@@ -409,6 +411,9 @@ static inline void log_heap(const char*) {}
 
 static void log_rxtx_line(char dir, int snr, int offset_hz, const std::string& text, int repeat_counter) {
   if (!g_rxtx_log) return;
+  if (!log_mutex) return;  // Not initialized yet
+
+  // Prepare log line outside mutex
   time_t now = (time_t)(rtc_now_ms() / 1000);
   struct tm t;
   localtime_r(&now, &t);
@@ -417,9 +422,17 @@ static void log_rxtx_line(char dir, int snr, int offset_hz, const std::string& t
            t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
            t.tm_hour, t.tm_min, t.tm_sec);
   double freq_mhz = 0.001 * (double)g_bands[g_band_sel].freq;
+
+  // Take mutex for file access
+  if (xSemaphoreTake(log_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+    ESP_LOGW(TAG, "RxTxLog mutex timeout");
+    return;
+  }
+
   FILE* f = fopen("/spiffs/RxTxLog.txt", "a");
   if (!f) {
     ESP_LOGW(TAG, "RxTxLog open failed");
+    xSemaphoreGive(log_mutex);
     return;
   }
   // For TX, omit SNR and repeat; for RX keep SNR.
@@ -431,6 +444,7 @@ static void log_rxtx_line(char dir, int snr, int offset_hz, const std::string& t
             dir, ts, freq_mhz, text.c_str(), snr, offset_hz);
   }
   fclose(f);
+  xSemaphoreGive(log_mutex);
 }
 
 static void qso_load_file_list() {
@@ -1464,12 +1478,19 @@ static void maybe_enqueue_beacon() {
 
   // Prevent duplicate: check if we already queued for this TX slot
   int64_t target_slot = now_slot + 1;
-  if (target_slot == last_beacon_slot) return;
+
+  // Protect access to last_beacon_slot and autoseq_start_cq
+  taskENTER_CRITICAL(&beacon_mux);
+  if (target_slot == last_beacon_slot) {
+    taskEXIT_CRITICAL(&beacon_mux);
+    return;
+  }
 
   // Use autoseq to start CQ with correct slot parity
   autoseq_start_cq(target_parity);
   g_tx_view_dirty = true;
   last_beacon_slot = target_slot;
+  taskEXIT_CRITICAL(&beacon_mux);
   debug_log_line("Beacon CQ queued");
 }
 
@@ -1490,11 +1511,17 @@ static void beacon_on_enable() {
     target_slot += 1;
   }
 
-  if (target_slot == last_beacon_slot) return;
+  // Protect access to last_beacon_slot and autoseq_start_cq
+  taskENTER_CRITICAL(&beacon_mux);
+  if (target_slot == last_beacon_slot) {
+    taskEXIT_CRITICAL(&beacon_mux);
+    return;
+  }
 
   autoseq_start_cq(target_parity);
   g_tx_view_dirty = true;
   last_beacon_slot = target_slot;
+  taskEXIT_CRITICAL(&beacon_mux);
 
   schedule_tx_if_idle();
 }
@@ -2471,6 +2498,10 @@ static void app_task_core0(void* /*param*/) {
     .format_if_mount_failed = true
   };
   ESP_ERROR_CHECK(esp_vfs_spiffs_register(&conf));
+
+  // Initialize mutexes for thread-safe operations
+  log_mutex = xSemaphoreCreateMutex();
+
   init_soft_uart();
   ui_init();
   
