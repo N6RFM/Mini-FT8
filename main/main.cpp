@@ -239,7 +239,7 @@ int64_t g_decode_slot_idx = -1; // set at decode trigger to tag RX lines with sl
 static volatile bool g_qso_xmit = false;        // TX is pending
 static volatile int g_target_slot_parity = 0;   // 0=even, 1=odd - parity of slot to TX on
 static volatile bool g_was_txing = false;       // We were transmitting (for tick timing)
-static int64_t g_last_slot_idx = -1;            // For slot boundary detection
+static int g_last_slot_parity = -1;             // For slot boundary detection (just parity, like reference)
 static const char* STATION_FILE = "/spiffs/StationData.ini";
 
 //enum class BeaconMode { OFF = 0, EVEN, EVEN2, ODD, ODD2 };
@@ -975,9 +975,9 @@ static void check_slot_boundary() {
   int slot_ms = (int)(now_ms % 15000);
   int slot_parity = (int)(slot_idx & 1);
 
-  // Detect slot boundary
-  if (slot_idx != g_last_slot_idx) {
-    g_last_slot_idx = slot_idx;
+  // Detect slot boundary (parity change)
+  if (slot_parity != g_last_slot_parity) {
+    g_last_slot_parity = slot_parity;
 
     // If we were transmitting, call tick to pop the completed TX entry
     if (g_was_txing) {

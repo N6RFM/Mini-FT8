@@ -213,16 +213,16 @@ Mini-FT8 now follows the same pattern:
 static volatile bool g_qso_xmit = false;        // TX is pending
 static volatile int g_target_slot_parity = 0;   // Parity for TX
 static volatile bool g_was_txing = false;       // For tick timing
-static int64_t g_last_slot_idx = -1;            // Slot boundary detection
+static int g_last_slot_parity = -1;             // Slot boundary detection (parity only)
 
 // Called from main loop every tick
 static void check_slot_boundary() {
     int64_t slot_idx = now_ms / 15000;
     int slot_parity = slot_idx & 1;
 
-    // Detect slot boundary
-    if (slot_idx != g_last_slot_idx) {
-        g_last_slot_idx = slot_idx;
+    // Detect slot boundary (parity change)
+    if (slot_parity != g_last_slot_parity) {
+        g_last_slot_parity = slot_parity;
 
         // If we were transmitting, call tick
         if (g_was_txing) {
