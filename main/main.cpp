@@ -348,6 +348,12 @@ static int64_t rtc_ms_start = 0;
 static int64_t rtc_last_update = 0;
 static bool rtc_valid = false;
 
+// RTC deep sleep compensation
+// rtc_sleep_epoch: epoch time when entering deep sleep (for calculating elapsed time)
+// rtc_comp: compensation factor in seconds per 10000 seconds (e.g., +150 = 1.5% fast)
+static time_t g_rtc_sleep_epoch = 0;
+static int g_rtc_comp = 0;
+
 enum class CqType { CQ, CQSOTA, CQPOTA, CQQRP, CQFD, CQFREETEXT };
 enum class OffsetSrc { RANDOM, CURSOR, RX };
 enum class RadioType { NONE, TRUSDX, QMX, KH1 };
@@ -906,6 +912,7 @@ static bool rtc_set_from_strings() {
 }
 
 // Initialize soft RTC from hardware RTC (persists through deep sleep)
+// Applies compensation if we have valid sleep epoch data
 static bool rtc_init_from_hw() {
   struct timeval tv;
   if (gettimeofday(&tv, NULL) != 0) return false;
@@ -915,12 +922,34 @@ static bool rtc_init_from_hw() {
   localtime_r(&tv.tv_sec, &t);
   if (t.tm_year + 1900 < 2020) return false;
 
-  rtc_epoch_base = tv.tv_sec;
+  time_t compensated_now = tv.tv_sec;
+
+  // Apply compensation if we have valid sleep data
+  if (g_rtc_sleep_epoch > 0 && tv.tv_sec > g_rtc_sleep_epoch) {
+    int64_t raw_elapsed = tv.tv_sec - g_rtc_sleep_epoch;
+    int64_t actual_elapsed = raw_elapsed;
+
+    // Apply compensation: actual = raw * 10000 / (10000 + comp)
+    if (g_rtc_comp != 0) {
+      actual_elapsed = raw_elapsed * 10000 / (10000 + g_rtc_comp);
+    }
+
+    compensated_now = g_rtc_sleep_epoch + actual_elapsed;
+
+    ESP_LOGI(TAG, "RTC wake: raw_elapsed=%lld, actual_elapsed=%lld, comp=%d",
+             (long long)raw_elapsed, (long long)actual_elapsed, g_rtc_comp);
+
+    // Clear sleep epoch after use (one-time compensation)
+    g_rtc_sleep_epoch = 0;
+  }
+
+  rtc_epoch_base = compensated_now;
   rtc_ms_start = esp_timer_get_time() / 1000;
   rtc_last_update = rtc_ms_start;
   rtc_valid = true;
 
-  // Update g_date/g_time strings
+  // Update g_date/g_time strings from compensated time
+  localtime_r(&compensated_now, &t);
   char buf_date[32];
   snprintf(buf_date, sizeof(buf_date), "%04d-%02d-%02d", t.tm_year + 1900, t.tm_mon + 1, t.tm_mday);
   g_date = buf_date;
@@ -928,7 +957,9 @@ static bool rtc_init_from_hw() {
   snprintf(buf_time, sizeof(buf_time), "%02d:%02d:%02d", t.tm_hour, t.tm_min, t.tm_sec);
   g_time = buf_time;
 
-  ESP_LOGI(TAG, "RTC initialized from hardware: %s %s", g_date.c_str(), g_time.c_str());
+  ESP_LOGI(TAG, "RTC initialized: %s %s (compensated=%s)",
+           g_date.c_str(), g_time.c_str(),
+           (g_rtc_comp != 0) ? "yes" : "no");
   return true;
 }
 
@@ -1874,7 +1905,12 @@ static void draw_menu_view() {
   lines.push_back(std::string("RxTxLog:") + (g_rxtx_log ? "ON" : "OFF"));
   lines.push_back(std::string("SkipTX1:") + (g_skip_tx1 ? "ON" : "OFF"));
   lines.push_back(std::string("ActiveBand:") + head_trim(g_active_band_text, 16));
-  lines.push_back(""); // padding
+  // RTC compensation: seconds per 10000 seconds (e.g., +150 = 1.5% fast)
+  if (menu_edit_idx == 15) {
+    lines.push_back(std::string("RTC Comp:") + menu_edit_buf);
+  } else {
+    lines.push_back(std::string("RTC Comp:") + std::to_string(g_rtc_comp));
+  }
   lines.push_back(""); // padding
   lines.push_back(""); // padding
 
@@ -2396,6 +2432,13 @@ static void load_station_data() {
       g_active_band_text = std::to_string(val);
     } else if (strncmp(line, "active_bands=", 13) == 0) {
       g_active_band_text = trim_copy(line + 13);
+    } else if (sscanf(line, "rtc_comp=%d", &g_rtc_comp) == 1) {
+      // Loaded rtc_comp
+    } else {
+      long long epoch_tmp = 0;
+      if (sscanf(line, "rtc_sleep_epoch=%lld", &epoch_tmp) == 1) {
+        g_rtc_sleep_epoch = (time_t)epoch_tmp;
+      }
     }
   }
   fclose(f);
@@ -2434,6 +2477,8 @@ static void save_station_data() {
   fprintf(f, "comment1=%s\n", g_comment1.c_str());
   fprintf(f, "rxtx_log=%d\n", g_rxtx_log ? 1 : 0);
   fprintf(f, "active_bands=%s\n", g_active_band_text.c_str());
+  fprintf(f, "rtc_sleep_epoch=%lld\n", (long long)g_rtc_sleep_epoch);
+  fprintf(f, "rtc_comp=%d\n", g_rtc_comp);
   fclose(f);
 }
 
@@ -3155,6 +3200,7 @@ static void app_task_core0(void* /*param*/) {
                 else if (menu_edit_idx == 7) { g_offset_hz = atoi(menu_edit_buf.c_str()); }
                 else if (menu_edit_idx == 9) { g_ant = menu_edit_buf; }
                 else if (menu_edit_idx == 10) { g_comment1 = menu_edit_buf; }
+                else if (menu_edit_idx == 15) { g_rtc_comp = atoi(menu_edit_buf.c_str()); }
                 save_station_data();
                 menu_edit_idx = -1;
                 menu_edit_buf.clear();
@@ -3223,7 +3269,15 @@ static void app_task_core0(void* /*param*/) {
               } else if (c == '6') {
                   if (M5.Power.isCharging()) {
                     ESP_LOGI(TAG, "Entering deep sleep (GPIO0 wake)");
-                    // Hardware RTC persists through deep sleep, no need to save
+                    // Save current accurate time for compensation after wake-up
+                    if (rtc_valid) {
+                      g_rtc_sleep_epoch = rtc_epoch_base +
+                          (esp_timer_get_time() / 1000 - rtc_ms_start) / 1000;
+                      rtc_sync_to_hw();  // Sync to hardware RTC
+                      save_station_data();
+                      ESP_LOGI(TAG, "Saved sleep epoch: %ld, comp=%d",
+                               (long)g_rtc_sleep_epoch, g_rtc_comp);
+                    }
                     M5.Display.sleep();
                     vTaskDelay(pdMS_TO_TICKS(100));
                     // Configure GPIO0 as wake-up source (active low)
@@ -3272,6 +3326,10 @@ static void app_task_core0(void* /*param*/) {
                 menu_long_kind = LONG_ACTIVE;
                 menu_long_buf = g_active_band_text;
                 menu_long_backup = g_active_band_text;
+                draw_menu_view();
+              } else if (c == '4') {
+                menu_edit_idx = 15; // RTC Comp line
+                menu_edit_buf = std::to_string(g_rtc_comp);
                 draw_menu_view();
               }
             }
