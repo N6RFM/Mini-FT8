@@ -1040,6 +1040,10 @@ static void check_slot_boundary() {
     int skip_tones = slot_ms / 160;
     if (skip_tones < 79) {
       g_qso_xmit = false;  // Clear flag before starting TX
+      // Log TX at slot boundary, right before sending (reference project pattern)
+      if (g_pending_tx_valid && !g_pending_tx.text.empty()) {
+        log_rxtx_line('T', 0, g_pending_tx.offset_hz, g_pending_tx.text, g_pending_tx.repeat_counter);
+      }
       tx_start_immediate(skip_tones);
     }
   }
@@ -1752,7 +1756,7 @@ static void tx_send_task(void* param) {
   }
   uint8_t tones[79] = {0};
   ft8_encode(msg.payload, tones);
-  log_rxtx_line('T', 0, e.offset_hz, e.text, e.repeat_counter);
+  // TX logging moved to check_slot_boundary() for reliable logging at 15s boundary
 
   // CAT: compute base TX audio offset
   int base_hz = 0;
