@@ -3175,6 +3175,9 @@ static void app_task_core0(void* /*param*/) {
               } else if (c == '6') {
                   if (M5.Power.isCharging()) {
                     ESP_LOGI(TAG, "Sleep button pressed while charging; entering deep sleep");
+                    // Save current RTC time before sleep so it persists across wake
+                    rtc_update_strings();
+                    save_station_data();
                     M5.Display.sleep();
                     vTaskDelay(pdMS_TO_TICKS(100));
                     esp_deep_sleep_start();
