@@ -1040,9 +1040,22 @@ static void check_slot_boundary() {
     int skip_tones = slot_ms / 160;
     if (skip_tones < 79) {
       g_qso_xmit = false;  // Clear flag before starting TX
-      // Log TX at slot boundary, right before sending (reference project pattern)
+
+      // Compute actual TX offset now (before logging) based on offset_src setting
       if (g_pending_tx_valid && !g_pending_tx.text.empty()) {
-        log_rxtx_line('T', 0, g_pending_tx.offset_hz, g_pending_tx.text, g_pending_tx.repeat_counter);
+        int actual_offset;
+        if (g_offset_src == OffsetSrc::CURSOR) {
+          actual_offset = g_offset_hz;
+        } else if (g_offset_src == OffsetSrc::RX &&
+                   g_pending_tx.offset_hz > 0 &&
+                   g_pending_tx.text.rfind("CQ ", 0) != 0) {
+          actual_offset = g_pending_tx.offset_hz;
+        } else {
+          // RANDOM mode or CQ in RX mode: generate random offset
+          actual_offset = 500 + (int)(esp_random() % 2001);
+        }
+        g_pending_tx.offset_hz = actual_offset;  // Store for tx_send_task to use
+        log_rxtx_line('T', 0, actual_offset, g_pending_tx.text, g_pending_tx.repeat_counter);
       }
       tx_start_immediate(skip_tones);
     }
@@ -1692,6 +1705,7 @@ static void schedule_tx_if_idle() {
 
 // Start TX immediately (called from check_slot_boundary at the right time)
 // This is the simplified TX trigger matching reference architecture
+// Uses g_pending_tx which was prepared by check_slot_boundary with correct offset
 static void tx_start_immediate(int skip_tones) {
   // Atomically check and set task handle
   taskENTER_CRITICAL(&mux);
@@ -1702,26 +1716,22 @@ static void tx_start_immediate(int skip_tones) {
   s_tx_task_handle = (TaskHandle_t)1;
   taskEXIT_CRITICAL(&mux);
 
-  // Fetch pending TX from autoseq
-  AutoseqTxEntry pending;
-  if (!autoseq_fetch_pending_tx(pending)) {
+  // Use g_pending_tx which was prepared by check_slot_boundary
+  // (with correct offset_hz already computed)
+  if (!g_pending_tx_valid || g_pending_tx.text.empty()) {
     s_tx_task_handle = NULL;
-    g_pending_tx_valid = false;
     ESP_LOGW(TAG, "tx_start_immediate: no pending TX");
     return;
   }
-
-  g_pending_tx = pending;
-  g_pending_tx_valid = true;
 
   // Get current slot info
   int64_t now_ms = rtc_now_ms();
   int64_t slot_idx = now_ms / 15000;
 
-  ESP_LOGI(TAG, "tx_start_immediate: TX=%s skip=%d slot=%lld",
-           pending.text.c_str(), skip_tones, (long long)slot_idx);
+  ESP_LOGI(TAG, "tx_start_immediate: TX=%s offset=%d skip=%d slot=%lld",
+           g_pending_tx.text.c_str(), g_pending_tx.offset_hz, skip_tones, (long long)slot_idx);
 
-  auto* ctx = new TxTaskContext{pending, 0, slot_idx, skip_tones};
+  auto* ctx = new TxTaskContext{g_pending_tx, 0, slot_idx, skip_tones};
   xTaskCreatePinnedToCore(tx_send_task, "tx_imm", 4096, ctx, 5, &s_tx_task_handle, 0);
 }
 
@@ -1756,21 +1766,11 @@ static void tx_send_task(void* param) {
   }
   uint8_t tones[79] = {0};
   ft8_encode(msg.payload, tones);
-  // TX logging moved to check_slot_boundary() for reliable logging at 15s boundary
 
-  // CAT: compute base TX audio offset
-  int base_hz = 0;
-  auto rand_off = []() {
-    uint32_t r = esp_random();
-    return 500 + (int)(r % 2001); // 500-2500
-  };
-  if (g_offset_src == OffsetSrc::CURSOR) {
-    base_hz = g_offset_hz;
-  } else if (g_offset_src == OffsetSrc::RX && e.offset_hz > 0 && e.text.rfind("CQ ", 0) != 0) {
-    base_hz = e.offset_hz;
-  } else {
-    base_hz = rand_off();
-  }
+  // Use pre-computed offset from check_slot_boundary (stored in e.offset_hz)
+  // This ensures log and actual TX use the same frequency
+  int base_hz = e.offset_hz;
+  ESP_LOGI(TAG, "TX base_hz=%d (from pre-computed offset, text=%s)", base_hz, e.text.c_str());
 
   bool cat_ok = cat_cdc_ready();
   if (cat_ok) {
