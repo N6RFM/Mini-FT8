@@ -39,6 +39,7 @@ extern "C" {
 #include <cctype>
 #include <cstdlib>
 #include <ctime>
+#include <sys/time.h>
 #include "esp_timer.h"
 #include "esp_sleep.h"
 #include "stream_uac.h"
@@ -904,6 +905,43 @@ static bool rtc_set_from_strings() {
   return true;
 }
 
+// Initialize soft RTC from hardware RTC (persists through deep sleep)
+static bool rtc_init_from_hw() {
+  struct timeval tv;
+  if (gettimeofday(&tv, NULL) != 0) return false;
+
+  // Check if hardware RTC has valid time (year > 2020)
+  struct tm t;
+  localtime_r(&tv.tv_sec, &t);
+  if (t.tm_year + 1900 < 2020) return false;
+
+  rtc_epoch_base = tv.tv_sec;
+  rtc_ms_start = esp_timer_get_time() / 1000;
+  rtc_last_update = rtc_ms_start;
+  rtc_valid = true;
+
+  // Update g_date/g_time strings
+  char buf_date[32];
+  snprintf(buf_date, sizeof(buf_date), "%04d-%02d-%02d", t.tm_year + 1900, t.tm_mon + 1, t.tm_mday);
+  g_date = buf_date;
+  char buf_time[16];
+  snprintf(buf_time, sizeof(buf_time), "%02d:%02d:%02d", t.tm_hour, t.tm_min, t.tm_sec);
+  g_time = buf_time;
+
+  ESP_LOGI(TAG, "RTC initialized from hardware: %s %s", g_date.c_str(), g_time.c_str());
+  return true;
+}
+
+// Sync hardware RTC from soft RTC (call after FT8 time sync)
+static void rtc_sync_to_hw() {
+  if (!rtc_valid) return;
+
+  time_t now = rtc_epoch_base + (esp_timer_get_time() / 1000 - rtc_ms_start) / 1000;
+  struct timeval tv = { .tv_sec = now, .tv_usec = 0 };
+  settimeofday(&tv, NULL);
+  ESP_LOGI(TAG, "Hardware RTC synced from soft RTC");
+}
+
 static void rtc_update_strings() {
   if (!rtc_valid) return;
   struct tm t;
@@ -1354,6 +1392,7 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
         rtc_ms_start -= delta_ms;
         rtc_last_update -= delta_ms;
         rtc_update_strings();
+        rtc_sync_to_hw();  // Persist to hardware RTC (survives deep sleep)
         ESP_LOGI("SYNC", "Applied RTC sync: median=%.2fs delta=%dms", median, delta_ms);
       } else {
         ESP_LOGD("SYNC", "Median=%.2fs within threshold; no sync", median);
@@ -2356,7 +2395,11 @@ static void load_station_data() {
     }
   }
   fclose(f);
-  rtc_set_from_strings();
+  // Try hardware RTC first (persists through deep sleep), fall back to saved strings
+  if (!rtc_init_from_hw()) {
+    ESP_LOGI(TAG, "Hardware RTC not valid, using saved time strings");
+    rtc_set_from_strings();
+  }
   rebuild_active_bands();
   g_beacon = BeaconMode::OFF; // force off on load
 }
@@ -3001,6 +3044,7 @@ static void app_task_core0(void* /*param*/) {
                   else g_time = status_edit_buffer;
                   save_station_data();
                   rtc_set_from_strings();
+                  rtc_sync_to_hw();  // Persist to hardware RTC
                   status_edit_idx = -1;
                   status_cursor_pos = -1;
                   status_edit_buffer.clear();
@@ -3174,12 +3218,12 @@ static void app_task_core0(void* /*param*/) {
                 draw_menu_view();
               } else if (c == '6') {
                   if (M5.Power.isCharging()) {
-                    ESP_LOGI(TAG, "Sleep button pressed while charging; entering deep sleep");
-                    // Save current RTC time before sleep so it persists across wake
-                    rtc_update_strings();
-                    save_station_data();
+                    ESP_LOGI(TAG, "Entering deep sleep (GPIO0 wake)");
+                    // Hardware RTC persists through deep sleep, no need to save
                     M5.Display.sleep();
                     vTaskDelay(pdMS_TO_TICKS(100));
+                    // Configure GPIO0 as wake-up source (active low)
+                    esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, 0);
                     esp_deep_sleep_start();
                   } else {
                     debug_log_line("Sleep skipped: not charging");
