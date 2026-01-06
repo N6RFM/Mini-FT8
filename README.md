@@ -15,6 +15,8 @@ It currently supports QMX only.
   - Must order: https://shop.m5stack.com/products/m5stack-cardputer-adv-version-esp32-s3
   - Optional:https://shop.m5stack.com/products/4pin-buckled-grove-cable
 (for a homebrew serial cable, or for charging when operating long time since USB-C is occupied by QMX)
+  - Optional:https://shop.m5stack.com/products/gps-bds-unit-v1-1-at6668
+(for future enhancement)
 
 73
 
