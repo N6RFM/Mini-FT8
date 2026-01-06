@@ -48,3 +48,11 @@ Flash size: 8MB. SPIFFS: 4MB at 0x190000. SPIFFS mount auto-formats on failure (
 ## HW RTC
 - To use the hardware RTC, put the M5 Cardputer into Sleep (Menu → 2nd page → Sleep) instead of powering it off. Wake it up with Btn GO (the right button behind the StampS3A). See docs/RTC_Compensation for calibration details.
 - The hardware RTC isn’t very accurate, but it should at least keep the date correct.
+
+## Download Logs
+- Recommand PUTTY(same app for QMX config)
+- Set Terminal - Implicit CR in every LF
+- Local echo: Force on
+- On M5 Carputer, click C to enter communication
+- On Putty, type command, e.g. "read 20260101.adi"
+  
