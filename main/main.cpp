@@ -639,7 +639,16 @@ static void ensure_usb() {
 static void host_write_str(const std::string& s) {
   ensure_usb();
   if (usb_ready) {
-    usb_serial_jtag_write_bytes((const uint8_t*)s.data(), s.size(), 0);
+    const uint8_t* p = reinterpret_cast<const uint8_t*>(s.data());
+    size_t remaining = s.size();
+    while (remaining > 0) {
+      size_t chunk = remaining;
+      if (chunk > 256) chunk = 256;
+      int written = usb_serial_jtag_write_bytes(p, chunk, portMAX_DELAY);
+      if (written <= 0) break;
+      p += written;
+      remaining -= written;
+    }
   }
   host_send_bt(s);
 }
