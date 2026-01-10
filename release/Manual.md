@@ -56,6 +56,6 @@ Flash size: 8MB. SPIFFS: 4MB at 0x190000. SPIFFS mount auto-formats on failure (
 - Local echo: Force on
 - On M5 Carputer, click C to enter communication
 - On Putty, type command, e.g. "read 20260101.adi"
-- or, use pc_terminal.py `python pc_terminal.py --baud 115200 COM11 help`
+- or, use pc_terminal.py `python .\pc_terminal.py --baud 115200 COM11 help`
   
   
