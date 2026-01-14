@@ -5,9 +5,9 @@
 It currently supports QMX only.
 
 ### Thanks
-  - DX-FT8 team: Barb (WB2CBA), Charley (W5BAA) and Paul (G8KIG)
+  - [DX FT8](https://github.com/WB2CBA/DX-FT8-FT8-MULTIBAND-TABLET-TRANSCEIVER) team: Barb (WB2CBA), Charley (W5BAA) and Paul (G8KIG)
   - Zhenxing (N6HAN) — big help getting past obstacles (especially UAC)
-  - Karlis Goba — ft8 library
+  - Karlis Goba — [ft8 library](https://github.com/kgoba/ft8_lib)
   - OpenAI and Anthropic for their incredible coding assistance
 
 ### Hardware
