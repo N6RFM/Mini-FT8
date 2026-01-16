@@ -17,6 +17,7 @@ ls -l /dev/ttyACM* /dev/ttyUSB* 2>/dev/null
 sudo usermod -aG dialout $USER
 newgrp dialout
 
-4) Flash
+4) Flash (change port according to 2)
 chmod +x flash.sh
+
 ./flash.sh
