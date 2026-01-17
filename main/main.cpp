@@ -3204,8 +3204,8 @@ static void app_task_core0(void* /*param*/) {
             } else if (menu_edit_idx >= 0) {
               if (c == '\n' || c == '\r') {
                 // Absolute indices across pages
-                if (menu_edit_idx == 3) { g_call = menu_edit_buf; }
-                else if (menu_edit_idx == 4) { g_grid = menu_edit_buf; }
+                if (menu_edit_idx == 3) { g_call = menu_edit_buf; autoseq_set_station(g_call, g_grid); }
+                else if (menu_edit_idx == 4) { g_grid = menu_edit_buf; autoseq_set_station(g_call, g_grid); }
                 else if (menu_edit_idx == 7) { g_offset_hz = atoi(menu_edit_buf.c_str()); }
                 else if (menu_edit_idx == 9) { g_ant = menu_edit_buf; }
                 else if (menu_edit_idx == 10) { g_comment1 = menu_edit_buf; }
