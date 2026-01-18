@@ -64,11 +64,17 @@ Download binary files and scripts from https://github.com/wcheng95/Mini-FT8/tree
 - The hardware RTC isn’t very accurate, but it should at least keep the date correct.
 
 ## Download Logs
-- Recommand PUTTY(same app for QMX config)
-- Set Terminal - Implicit CR in every LF
-- Local echo: Force on
 - On M5 Carputer, click C to enter communication
-- On Putty, type command, e.g. "read 20260101.adi"
-- or, use pc_terminal.py `python .\pc_terminal.py --baud 115200 COM11 help`
+- **use pc_terminal.py** `python .\pc_terminal.py COM11 help`
+```
+  read 20260113.adi
+  read RxTxLog.txt
+```
+  (files will be written into current directory)
+- Make sure pyserial is installed (`pip install pyserial`).
+- **Ubuntu/Linux**: use the device node, e.g. `python3 pc_terminal.py /dev/ttyACM0 (or /dev/ttyUSB0)`
+- On Ubuntu, ensure your user can access the port: `sudo usermod -a -G dialout $USER`(then log out/in), or temporarily `sudo chmod a+rw /dev/ttyACM0`
+- **use PuTTY**(Set Terminal - Implicit CR in every LF; Local echo: Force on)
+- **use Arduino IDE serial monitor**
   
   
