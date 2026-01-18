@@ -72,6 +72,19 @@ def cmd_read(ser, remote: str, local: str):
     print(f"Saved {len(data)} bytes to {local}")
 
 
+def cmd_delete(ser, remote: str):
+    send_line(ser, f"DELETE {remote}")
+    data = bytearray()
+    while True:
+        chunk = ser.read(1024)
+        if chunk:
+            data.extend(chunk)
+            continue
+        break
+    if data:
+        print(data.decode(errors="replace").rstrip())
+
+
 def cmd_write(ser, local: str, remote: str):
     size = os.path.getsize(local)
     with open(local, "rb") as f:
@@ -131,6 +144,8 @@ def main():
             if len(cmd_parts) >= 3:
                 remote = cmd_parts[2]
             cmd_write(ser, local, remote)
+        elif cmd == "delete" and len(cmd_parts) >= 2:
+            cmd_delete(ser, cmd_parts[1])
         else:
             print("Unknown/invalid command:", " ".join(cmd_parts))
 
