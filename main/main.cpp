@@ -2108,10 +2108,10 @@ static void host_debug_hex8(const char* prefix, const uint8_t* b) {
 static void host_handle_line(const std::string& line_in) {
   bool send_prompt = true;
   std::string line = trim_copy(line_in);
-  if (line.empty()) { host_write_str(HOST_PROMPT); return; }
+  if (line.empty()) { /* host_write_str(HOST_PROMPT);*/ return; }
   debug_log_line(std::string("[HOST RX] ") + line);
-  std::string echo = std::string("ECHO: ") + line + "\r\n";
-  host_write_str(echo);
+  //std::string echo = std::string("ECHO: ") + line + "\r\n";
+  //host_write_str(echo);
 
   auto to_upper = [](std::string s) {
     for (auto& c : s) c = toupper((unsigned char)c);
@@ -2153,7 +2153,8 @@ static void host_handle_line(const std::string& line_in) {
         char buf[128];
         while (fgets(buf, sizeof(buf), f)) host_write_str(std::string(buf));
         fclose(f);
-        send("OK");
+        //send("OK");
+        send_prompt = false;
       }
     }
   } else if (cmd_up == "DELETE") {
@@ -2338,11 +2339,11 @@ static void host_process_bytes(const uint8_t* buf, size_t len) {
     char ch = (char)buf[i++];
     if (ch == '\r' || ch == '\n') {
       if (!host_input.empty()) {
-    ESP_LOGI(TAG, "HOST line: %s", host_input.c_str());
+    //ESP_LOGI(TAG, "HOST line: %s", host_input.c_str());
         host_handle_line(host_input);
         host_input.clear();
       } else {
-        host_write_str(std::string(HOST_PROMPT));
+        //host_write_str(std::string(HOST_PROMPT));
       }
     } else if (ch == 0x08 || ch == 0x7f) {
       if (!host_input.empty()) host_input.pop_back();

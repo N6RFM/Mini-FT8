@@ -59,11 +59,17 @@ def cmd_simple(ser, cmd: str):
 
 def cmd_read(ser, remote: str, local: str):
     send_line(ser, f"READ {remote}")
-    lines = read_until_prompt(ser, echo=False, timeout=15.0)
+    data = bytearray()
+    while True:
+        chunk = ser.read(1024)
+        if chunk:
+            data.extend(chunk)
+            continue
+        # no data within serial timeout -> assume done
+        break
     with open(local, "wb") as f:
-        for ln in lines:
-            f.write(ln + b"\n")
-    print(f"Saved {len(lines)} lines to {local}")
+        f.write(data)
+    print(f"Saved {len(data)} bytes to {local}")
 
 
 def cmd_write(ser, local: str, remote: str):
