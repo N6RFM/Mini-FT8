@@ -7,6 +7,7 @@ extern "C" {
   #include "ft8/constants.h"
   #include "ft8/message.h"
   #include "ft8/encode.h"
+  #include "ft8/debug.h"
   #include "common/monitor.h"
 }
 
@@ -43,6 +44,7 @@ extern "C" {
 #include "esp_timer.h"
 #include "esp_sleep.h"
 #include "stream_uac.h"
+
 #define ENABLE_BLE 0
 
 #if ENABLE_BLE
@@ -141,6 +143,7 @@ static const struct ble_gatt_svc_def gatt_svcs[] = {
     { 0 }  // terminator
 };
 
+
 static void init_bluetooth(void)
 {
     static bool inited = false;
@@ -224,6 +227,154 @@ static int gap_cb(struct ble_gap_event *event, void *arg)
 [[maybe_unused]] static uint8_t ble_rx_placeholder = 0;
 [[maybe_unused]] static uint8_t ble_tx_placeholder = 0;
 #endif // ENABLE_BLE
+
+#define CALLSIGN_HASHTABLE_SIZE 128
+
+static struct
+{
+    char callsign[12]; ///> Up to 11 symbols of callsign + trailing zeros (always filled)
+    uint32_t hash;     ///> 8 MSBs contain the age of callsign; 22 LSBs contain hash value
+} callsign_hashtable[CALLSIGN_HASHTABLE_SIZE];
+
+static int callsign_hashtable_size;
+
+void hashtable_init(void)
+{
+    callsign_hashtable_size = 0;
+    memset(callsign_hashtable, 0, sizeof(callsign_hashtable));
+}
+
+// Increment age for all existing entries (saturate at 255). Call once per slot.
+static void hashtable_age_all(void)
+{
+    for (int idx_hash = 0; idx_hash < CALLSIGN_HASHTABLE_SIZE; ++idx_hash)
+    {
+        if (callsign_hashtable[idx_hash].callsign[0] != '\0')
+        {
+            uint8_t age = (uint8_t)(callsign_hashtable[idx_hash].hash >> 24);
+            if (age < 255)
+            {
+                age++;
+                callsign_hashtable[idx_hash].hash = ((uint32_t)age << 24) | (callsign_hashtable[idx_hash].hash & 0x3FFFFFu);
+            }
+        }
+    }
+}
+
+// Trim the hash table if it grows too large by evicting the oldest entries
+void hashtable_trim_size(int max_size)
+{
+    while (callsign_hashtable_size > max_size)
+    {
+        int oldest_idx = -1;
+        uint8_t oldest_age = 0;
+        for (int idx_hash = 0; idx_hash < CALLSIGN_HASHTABLE_SIZE; ++idx_hash)
+        {
+            if (callsign_hashtable[idx_hash].callsign[0] == '\0')
+            {
+                continue;
+            }
+            uint8_t age = (uint8_t)(callsign_hashtable[idx_hash].hash >> 24);
+            if (oldest_idx < 0 || age > oldest_age)
+            {
+                oldest_idx = idx_hash;
+                oldest_age = age;
+            }
+        }
+        if (oldest_idx < 0)
+        {
+            break;
+        }
+        LOG(LOG_INFO, "Hashtable trim: removing oldest [%s], age = %d\n",
+            callsign_hashtable[oldest_idx].callsign, oldest_age);
+        callsign_hashtable[oldest_idx].callsign[0] = '\0';
+        callsign_hashtable[oldest_idx].hash = 0;
+        callsign_hashtable_size--;
+    }
+}
+
+void hashtable_add(const char* callsign, uint32_t hash)
+{
+    uint32_t hash_payload = hash & 0x3FFFFFu; // lower 22 bits carry the hash value
+    uint16_t hash10 = (hash >> 12) & 0x3FFu;
+    int idx_hash = (hash10 * 23) % CALLSIGN_HASHTABLE_SIZE;
+    // Double-hash step: force odd so it's coprime with 256 and will visit every slot
+    int step = (int)((hash_payload % (CALLSIGN_HASHTABLE_SIZE / 2)) * 2 + 1);
+    while (callsign_hashtable_size >= CALLSIGN_HASHTABLE_SIZE)
+    {
+        // Table is full; evict down to the target size to make room
+        hashtable_trim_size(230);
+        if (callsign_hashtable_size >= CALLSIGN_HASHTABLE_SIZE)
+        {
+            LOG(LOG_INFO, "Hash table full; ignoring new callsign [%s]\n", callsign);
+            return;
+        }
+    }
+    int start_idx = idx_hash;
+    while (callsign_hashtable[idx_hash].callsign[0] != '\0')
+    {
+        uint32_t existing_hash = callsign_hashtable[idx_hash].hash & 0x3FFFFFu;
+        if ((existing_hash == hash_payload) && (0 == strcmp(callsign_hashtable[idx_hash].callsign, callsign)))
+        {
+            // reset age
+            callsign_hashtable[idx_hash].hash = hash_payload;
+            LOG(LOG_DEBUG, "Found a duplicate [%s]\n", callsign);
+            return;
+        }
+        else if (existing_hash == hash_payload)
+        {
+            // Evict the previous callsign for this hash and replace with the new one
+            LOG(LOG_INFO, "Evicting [%s] for hash collision with [%s]\n",
+                callsign_hashtable[idx_hash].callsign, callsign);
+            callsign_hashtable[idx_hash].callsign[0] = '\0';
+            callsign_hashtable_size--;
+            break;
+        }
+        else
+        {
+            LOG(LOG_DEBUG, "Hash table clash!\n");
+            // Move on to check the next entry in hash table
+            idx_hash = (idx_hash + step) % CALLSIGN_HASHTABLE_SIZE;
+            if (idx_hash == start_idx)
+            {
+                LOG(LOG_INFO, "Hash table probe wrapped without finding a slot; aborting insert for [%s]\n", callsign);
+                return;
+            }
+        }
+    }
+    callsign_hashtable_size++;
+    strncpy(callsign_hashtable[idx_hash].callsign, callsign, 11);
+    callsign_hashtable[idx_hash].callsign[11] = '\0';
+    callsign_hashtable[idx_hash].hash = hash_payload;
+}
+
+bool hashtable_lookup(ftx_callsign_hash_type_t hash_type, uint32_t hash, char* callsign)
+{
+    uint8_t hash_shift = (hash_type == FTX_CALLSIGN_HASH_10_BITS) ? 12 : (hash_type == FTX_CALLSIGN_HASH_12_BITS ? 10 : 0);
+    uint16_t hash10 = (hash >> (12 - hash_shift)) & 0x3FFu;
+    int idx_hash = (hash10 * 23) % CALLSIGN_HASHTABLE_SIZE;
+    while (callsign_hashtable[idx_hash].callsign[0] != '\0')
+    {
+        if (((callsign_hashtable[idx_hash].hash & 0x3FFFFFu) >> hash_shift) == hash)
+        {
+            strcpy(callsign, callsign_hashtable[idx_hash].callsign);
+            // Reset age on successful lookup (touched this slot)
+            callsign_hashtable[idx_hash].hash &= 0x00FFFFFFu;
+            return true;
+        }
+        // Move on to check the next entry in hash table
+        idx_hash = (idx_hash + 1) % CALLSIGN_HASHTABLE_SIZE;
+    }
+    callsign[0] = '\0';
+    return false;
+}
+
+ftx_callsign_hash_interface_t hash_if = {
+    .lookup_hash = hashtable_lookup,
+    .save_hash = hashtable_add
+};
+
+
 
 static const char* TAG = "FT8";
 enum class UIMode { RX, TX, BAND, MENU, HOST, CONTROL, DEBUG, LIST, STATUS, QSO };
@@ -1057,6 +1208,8 @@ static void check_slot_boundary() {
   if (slot_parity != g_last_slot_parity) {
     g_last_slot_parity = slot_parity;
 
+    hashtable_age_all();
+
     // If we were transmitting, call tick to pop the completed TX entry
     if (g_was_txing) {
       ESP_LOGI(TAG, "Slot boundary: was_txing, calling tick");
@@ -1576,7 +1729,7 @@ static void encode_and_log_pending_tx() {
     return;
   }
   ftx_message_t msg;
-  ftx_message_rc_t rc = ftx_message_encode(&msg, NULL, g_pending_tx.text.c_str());
+  ftx_message_rc_t rc = ftx_message_encode(&msg, &hash_if, g_pending_tx.text.c_str());
   if (rc != FTX_MESSAGE_RC_OK) {
     debug_log_line("Encode failed");
     return;
@@ -1797,7 +1950,7 @@ static void tx_send_task(void* param) {
   }
 
   ftx_message_t msg;
-  ftx_message_rc_t rc = ftx_message_encode(&msg, NULL, e.text.c_str());
+  ftx_message_rc_t rc = ftx_message_encode(&msg, &hash_if, e.text.c_str());
   if (rc != FTX_MESSAGE_RC_OK) {
     ESP_LOGE(TAG, "Encode failed for TX");
     s_tx_task_handle = NULL;
@@ -2637,6 +2790,7 @@ static void app_task_core0(void* /*param*/) {
 
   init_soft_uart();
   ui_init();
+  hashtable_init();
   
   std::vector<UiRxLine> empty;
   ui_set_rx_list(empty);
