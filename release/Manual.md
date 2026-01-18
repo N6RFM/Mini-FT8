@@ -19,7 +19,9 @@ Download binary files and scripts from https://github.com/wcheng95/Mini-FT8/tree
   ```
 - Ubuntu:
   open readme.Ubuntu.txt
-
+- **For M5Launcher**:
+  open readme.M5Launcher.txt
+  
 ## First Connection (QMX)
 1) Power on Mini-FT8.  
 2) Press `s` (Status) → press `2` (“Connect to /Radio”) to start UAC host.  
