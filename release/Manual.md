@@ -9,6 +9,17 @@ idf.py -p COMx flash
 ```
 Flash size: 8MB. SPIFFS: 4MB at 0x190000. SPIFFS mount auto-formats on failure (preserves files unless erased).
 
+## Flash without build
+Download binary files and scripts from https://github.com/wcheng95/Mini-FT8/tree/main/release
+- Windows:
+  ```
+    pip install esptool
+    Edit $Port below to match your device (e.g., COM11)
+    .\flash.ps1
+  ```
+- Ubuntu:
+  open readme.Ubuntu.txt
+
 ## First Connection (QMX)
 1) Power on Mini-FT8.  
 2) Press `s` (Status) → press `2` (“Connect to /Radio”) to start UAC host.  
