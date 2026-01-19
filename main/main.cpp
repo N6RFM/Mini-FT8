@@ -374,7 +374,14 @@ ftx_callsign_hash_interface_t hash_if = {
     .save_hash = hashtable_add
 };
 
+static std::string normalize_call_token(std::string s) {
+  // trim <> wrappers used for hashed nonstd calls
+  if (!s.empty() && s.front() == '<') s.erase(s.begin());
+  if (!s.empty() && s.back()  == '>') s.pop_back();
 
+  for (auto& ch : s) ch = (char)toupper((unsigned char)ch);
+  return s;
+}
 
 static const char* TAG = "FT8";
 enum class UIMode { RX, TX, BAND, MENU, HOST, CONTROL, DEBUG, LIST, STATUS, QSO };
@@ -1599,7 +1606,8 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
     if (line.text.rfind("CQ ", 0) == 0 || line.text == "CQ") line.is_cq = true;
 
     // to-me detection (same behavior as your old code)
-    std::string f1_up = to_upper(line.field1);
+    //std::string f1_up = to_upper(line.field1);
+    std::string f1_up = normalize_call_token(line.field1);
     if (!mycall_up.empty() && f1_up == mycall_up) line.is_to_me = true;
 
     ui_lines.push_back(line);
@@ -1638,7 +1646,8 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
   std::vector<UiRxLine> to_me, cqs, others;
   std::string mycall = to_upper(g_call);
   for (auto& l : ui_lines) {
-    std::string f1 = to_upper(l.field1);
+    //std::string f1 = to_upper(l.field1);
+    std::string f1 = normalize_call_token(l.field1);
     if (!mycall.empty() && !f1.empty() && f1 == mycall) {
       l.is_to_me = true;
       to_me.push_back(l);
