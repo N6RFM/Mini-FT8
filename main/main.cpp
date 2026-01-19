@@ -507,7 +507,7 @@ static int g_rtc_comp = 0;
 
 enum class CqType { CQ, CQSOTA, CQPOTA, CQQRP, CQFD, CQFREETEXT };
 enum class OffsetSrc { RANDOM, CURSOR, RX };
-enum class RadioType { NONE, TRUSDX, QMX, KH1 };
+enum class RadioType { NONE, TRUSDX, QMX };
 static CqType g_cq_type = CqType::CQ;
 static std::string g_cq_freetext = "FreeText";
 static bool g_skip_tx1 = false;
@@ -730,7 +730,6 @@ static void log_adif_entry(const std::string& dxcall, const std::string& dxgrid,
     switch (r) {
       case RadioType::TRUSDX: return "TRUSDX";
       case RadioType::QMX: return "QMX";
-      case RadioType::KH1: return "KH1";
       default: return "None";
     }
   };
@@ -996,7 +995,6 @@ static const char* radio_name(RadioType r) {
     case RadioType::NONE: return "None";
     case RadioType::TRUSDX: return "truSDX";
     case RadioType::QMX: return "QMX";
-    case RadioType::KH1: return "KH1";
   }
   return "None";
 }
@@ -1506,7 +1504,7 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
       char call_de[14] = {0};
       char extra[10] = {0};
       ftx_field_t fields[FTX_MAX_MESSAGE_FIELDS];
-      ftx_message_rc_t rc = ftx_message_decode_std(&message, NULL, call_to, call_de, extra, fields);
+      ftx_message_rc_t rc = ftx_message_decode_std(&message, &hash_if, call_to, call_de, extra, fields);
       if (rc == FTX_MESSAGE_RC_OK) {
         snprintf(text, sizeof(text), "%s %s %s", call_to, call_de, extra);
       } else {
