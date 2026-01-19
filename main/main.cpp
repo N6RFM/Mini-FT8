@@ -1206,8 +1206,6 @@ static void check_slot_boundary() {
   if (slot_parity != g_last_slot_parity) {
     g_last_slot_parity = slot_parity;
 
-    hashtable_age_all();
-
     // If we were transmitting, call tick to pop the completed TX entry
     if (g_was_txing) {
       ESP_LOGI(TAG, "Slot boundary: was_txing, calling tick");
@@ -1403,63 +1401,57 @@ static int parse_report_snr(const std::string& f3) {
 
 void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool update_ui) {
   const int max_cand = 50;
-  ftx_candidate_t candidates[max_cand];
+  static ftx_candidate_t candidates[max_cand];
   int num_candidates = ftx_find_candidates(&mon->wf, max_cand, candidates, 5);
   ESP_LOGI(TAG, "Candidates found: %d", num_candidates);
 
-  // Estimate noise floor in dB from the waterfall (mean of all bins in slot)
+  // ---- slot index + once-per-slot hashtable maintenance ----
+  int64_t slot_idx = -1;
+  if (g_decode_slot_idx >= 0) {
+    slot_idx = g_decode_slot_idx;
+  } else {
+    slot_idx = rtc_now_ms() / 15000LL;
+  }
+  int slot_id = (int)(slot_idx & 1);
+
+  // Age callsign hash table once per slot
+  static int64_t s_last_aged_slot = -1;
+  if (slot_idx != s_last_aged_slot) {
+    s_last_aged_slot = slot_idx;
+    hashtable_age_all();
+  }
+
+  // ---- estimate noise floor (your existing approach) ----
   float noise_db = -120.0f;
   if (mon->wf.mag && mon->wf.num_blocks > 0) {
     const size_t total = (size_t)mon->wf.num_blocks * (size_t)mon->wf.block_stride;
-    uint32_t hist[256] = {0};
-    for (size_t i = 0; i < total; ++i) {
-      hist[mon->wf.mag[i]]++;
-    }
-    uint64_t target = total / 3;  // 33th percentile to avoid signal bias
+    static uint32_t hist[256] = {0};
+    for (size_t i = 0; i < total; ++i) hist[mon->wf.mag[i]]++;
+    uint64_t target = total / 3;  // 33th percentile
     uint64_t accum = 0;
     int noise_scaled = 0;
     for (int v = 0; v < 256; ++v) {
       accum += hist[v];
-      if (accum >= target) {
-        noise_scaled = v;
-        break;
-      }
+      if (accum >= target) { noise_scaled = v; break; }
     }
-    noise_db = 0.5f * ((float)noise_scaled - 240.0f);  // scaled back to dB
+    noise_db = 0.5f * ((float)noise_scaled - 240.0f);
   }
 
-  int slot_id = 0;
-  if (g_decode_slot_idx >= 0) {
-    slot_id = (int)(g_decode_slot_idx & 1);
-  } else {
-    int64_t now_ms = rtc_now_ms();
-    slot_id = (int)((now_ms / 15000LL) & 1);
-  }
-
-  auto to_upper = [](const std::string& s) {
-    std::string out = s;
-    for (auto& ch : out) ch = toupper((unsigned char)ch);
-    return out;
+  auto to_upper = [](std::string s) {
+    for (auto& ch : s) ch = (char)toupper((unsigned char)ch);
+    return s;
   };
   std::string mycall_up = to_upper(g_call);
 
-  auto fill_fields = [](UiRxLine& line, const std::string& text,
-                        const char* call_to, const char* call_de, const char* extra) {
-    // Prefer library-provided fields when present
-    if (call_to && call_de && extra &&
-        call_to[0] != '\0' && call_de[0] != '\0') {
-      line.field1 = call_to;
-      line.field2 = call_de;
-      line.field3 = extra ? extra : "";
-      return;
-    }
-    // Fallback heuristic split
+  auto fill_fields_from_text = [&](UiRxLine& line) {
+    // Split tokens
     std::vector<std::string> toks;
     {
-      std::istringstream iss(text);
+      std::istringstream iss(line.text);
       std::string tok;
       while (iss >> tok) toks.push_back(tok);
     }
+
     auto is_digits = [](const std::string& s) {
       return !s.empty() && std::all_of(s.begin(), s.end(),
         [](char c){ return c >= '0' && c <= '9'; });
@@ -1468,154 +1460,185 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
       return !s.empty() && std::all_of(s.begin(), s.end(),
         [](char c){ return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'); });
     };
+
+    line.field1.clear(); line.field2.clear(); line.field3.clear();
+
+    // Heuristic: CQ <num/word> CALL GRID  (e.g. CQ DX W1XYZ FN31)
     if (!toks.empty() && toks[0] == "CQ" && toks.size() >= 2) {
       bool short_token = (toks[1].size() <= 3 && is_digits(toks[1])) ||
                          (toks[1].size() <= 4 && is_alpha(toks[1]));
       if (short_token) {
-        // CQ <num/word> CALL GRID
         line.field1 = toks[1];
         if (toks.size() > 2) line.field2 = toks[2];
         if (toks.size() > 3) line.field3 = toks[3];
         return;
       }
     }
+
+    // Default: first 3 tokens
     if (!toks.empty()) line.field1 = toks[0];
     if (toks.size() > 1) line.field2 = toks[1];
     if (toks.size() > 2) line.field3 = toks[2];
   };
 
-    std::vector<UiRxLine> ui_lines;
-    std::vector<float> time_offsets;
-    if (num_candidates > 0) {
-      int decodedCount = 0;
-      std::unordered_map<std::string, int> seen_idx; // text -> index in ui_lines
-      for (int i = 0; i < num_candidates; ++i) {
-        ftx_message_t message;
-      ftx_decode_status_t status;
-      memset(&message, 0, sizeof(message));
-      memset(&status, 0, sizeof(status));
+  // ---- local message de-duplication like reference decode() ----
+  // Dedupe based on message.hash and payload bytes.
+  const int kMaxDecoded = 50; // keep <= max_cand
+  static ftx_message_t decoded[kMaxDecoded];
+  static ftx_message_t* decoded_hashtable[kMaxDecoded];
+  for (int i = 0; i < kMaxDecoded; ++i) decoded_hashtable[i] = nullptr;
+  int num_decoded = 0;
 
-      if (!ftx_decode_candidate(&mon->wf, &candidates[i], 25, &message, &status)) {
-        continue;
-      }
+  std::vector<UiRxLine> ui_lines;
+  ui_lines.reserve(32);
+  std::vector<float> time_offsets;
+  time_offsets.reserve(32);
 
-      char text[40] = {0};
-      char call_to[14] = {0};
-      char call_de[14] = {0};
-      char extra[10] = {0};
-      ftx_field_t fields[FTX_MAX_MESSAGE_FIELDS];
-      ftx_message_rc_t rc = ftx_message_decode_std(&message, &hash_if, call_to, call_de, extra, fields);
-      if (rc == FTX_MESSAGE_RC_OK) {
-        snprintf(text, sizeof(text), "%s %s %s", call_to, call_de, extra);
-      } else {
-        ftx_message_decode_free(&message, text);
-      }
-
-      if (text[0] != '\0') {
-        float freq_hz = (mon->min_bin + candidates[i].freq_offset +
-                         candidates[i].freq_sub / (float)cfg->freq_osr) / mon->symbol_period;
-        float time_s = (candidates[i].time_offset +
-                        candidates[i].time_sub / (float)cfg->time_osr) * mon->symbol_period;
-        // Approximate candidate power from waterfall bin
-        float cand_db = noise_db;
-        {
-          int t_index = candidates[i].time_offset * mon->wf.time_osr + candidates[i].time_sub;
-          int f_index = candidates[i].freq_offset * mon->wf.freq_osr + candidates[i].freq_sub;
-          size_t offset = (size_t)t_index * (size_t)mon->wf.block_stride + (size_t)f_index;
-          size_t total = (size_t)mon->wf.num_blocks * (size_t)mon->wf.block_stride;
-          if (mon->wf.mag && offset < total) {
-            int scaled = mon->wf.mag[offset];
-            cand_db = 0.5f * ((float)scaled - 240.0f);
-          }
-        }
-        float snr_db = cand_db - noise_db;
-        // Quantize to even integers and clamp to WSJT-like range [-30, 32]
-        int snr_q = (int)lrintf(snr_db / 2.0f) * 2;
-        if (snr_q < -30) snr_q = -30;
-        if (snr_q > 32) snr_q = 32;
-
-        ESP_LOGI(TAG, "Decoded[%d] t=%.2fs f=%.1fHz snr=%d : %s",
-                 decodedCount, time_s, freq_hz, snr_q, text);
-        // Deduplicate exact text but keep the highest SNR
-        std::string text_str(text);
-        auto it = seen_idx.find(text_str);
-        if (it != seen_idx.end()) {
-          int idx = it->second;
-          if (snr_q > ui_lines[idx].snr) {
-            ui_lines[idx].snr = snr_q;
-            ui_lines[idx].offset_hz = (int)lrintf(freq_hz);
-            ui_lines[idx].slot_id = slot_id;
-            // Refresh parsed fields from the stronger decode
-            fill_fields(ui_lines[idx], ui_lines[idx].text,
-                        rc == FTX_MESSAGE_RC_OK ? call_to : nullptr,
-                        rc == FTX_MESSAGE_RC_OK ? call_de : nullptr,
-                        rc == FTX_MESSAGE_RC_OK ? extra : nullptr);
-            if (!mycall_up.empty() && to_upper(ui_lines[idx].field1) == mycall_up) {
-            // active call tracking disabled
-          }
-          }
-          continue;
-        }
-
-          UiRxLine line;
-          line.text = text;
-          line.snr = snr_q;
-          line.offset_hz = (int)lrintf(freq_hz);
-          line.slot_id = slot_id;
-          time_offsets.push_back(time_s);
-          fill_fields(line, line.text, rc == FTX_MESSAGE_RC_OK ? call_to : nullptr,
-                      rc == FTX_MESSAGE_RC_OK ? call_de : nullptr,
-                    rc == FTX_MESSAGE_RC_OK ? extra : nullptr);
-        if (line.text.rfind("CQ ", 0) == 0 || line.text == "CQ") {
-          line.is_cq = true;
-        }
-        std::string f1_up = to_upper(line.field1);
-        if (!mycall_up.empty() && f1_up == mycall_up) {
-          line.is_to_me = true;
-          // active call tracking disabled
-        }
-        ui_lines.push_back(line);
-        seen_idx[text_str] = (int)ui_lines.size() - 1;
-        log_rxtx_line('R', snr_q, (int)lrintf(freq_hz), text_str, -1);
-        decodedCount++;
-        if (decodedCount >= 32) break; // safety cap
-      }
-    }
-    if (decodedCount == 0) {
-      ESP_LOGW(TAG, "Candidates present but no messages decoded");
-    }
-  } else {
+  if (num_candidates <= 0) {
     ESP_LOGW(TAG, "No candidates found");
+    g_rx_lines.clear();
+    if (update_ui) { ui_set_rx_list(g_rx_lines); ui_draw_rx(); }
+    else g_rx_dirty = true;
+    return;
   }
 
-  // Auto sync: if >3 decodes, use median time offset and apply immediately (bounded)
-    if (time_offsets.size() > 3) {
-      std::vector<float> tmp = time_offsets;
-      std::sort(tmp.begin(), tmp.end());
-      float median = tmp[tmp.size() / 2];
-      if (std::fabs(median) > 0.3f) {
-        int delta_ms = (int)lrintf(-median * 1000.0f);
-        if (delta_ms > 320) delta_ms = 320;
-        if (delta_ms < -320) delta_ms = -320;
-        rtc_ms_start -= delta_ms;
-        rtc_last_update -= delta_ms;
-        rtc_update_strings();
-        rtc_sync_to_hw();  // Persist to hardware RTC (survives deep sleep)
-        ESP_LOGI("SYNC", "Applied RTC sync: median=%.2fs delta=%dms", median, delta_ms);
-      } else {
-        ESP_LOGD("SYNC", "Median=%.2fs within threshold; no sync", median);
-      }
+  int decodedCount = 0;
+  std::unordered_map<std::string, int> seen_idx; // displayed-text -> ui_lines index
+
+  for (int i = 0; i < num_candidates; ++i) {
+    ftx_message_t message;
+    ftx_decode_status_t status;
+    memset(&message, 0, sizeof(message));
+    memset(&status, 0, sizeof(status));
+
+    if (!ftx_decode_candidate(&mon->wf, &candidates[i], 25, &message, &status)) {
+      continue;
     }
 
-  // Sort into reply-to-me, CQ, other; preserve order within each group
-  std::vector<UiRxLine> to_me;
-  std::vector<UiRxLine> cqs;
-  std::vector<UiRxLine> others;
-  std::string mycall = g_call;
-  for (auto& ch : mycall) ch = toupper((unsigned char)ch);
+    // --- payload/hash dedupe (open addressing) ---
+    int idx_hash = (int)(message.hash % kMaxDecoded);
+    bool found_empty = false;
+    bool found_dup = false;
+    for (int probe = 0; probe < kMaxDecoded; ++probe) {
+      ftx_message_t* p = decoded_hashtable[idx_hash];
+      if (p == nullptr) { found_empty = true; break; }
+      if (p->hash == message.hash &&
+          0 == memcmp(p->payload, message.payload, sizeof(message.payload))) {
+        found_dup = true;
+        break;
+      }
+      idx_hash = (idx_hash + 1) % kMaxDecoded;
+    }
+    if (found_dup) continue;
+    if (!found_empty) continue; // table full; drop extras
+
+    // store unique
+    memcpy(&decoded[idx_hash], &message, sizeof(message));
+    decoded_hashtable[idx_hash] = &decoded[idx_hash];
+    ++num_decoded;
+
+    // --- decode to human text using ftx_message_decode ONLY ---
+    char text[FTX_MAX_MESSAGE_LENGTH] = {0};
+    ftx_message_offsets_t offsets;
+    ftx_message_rc_t urc = ftx_message_decode(&message, &hash_if, text, &offsets);
+    if (urc != FTX_MESSAGE_RC_OK || text[0] == '\0') {
+      continue;
+    }
+
+    // freq/time/SNR like your current code
+    float freq_hz = (mon->min_bin + candidates[i].freq_offset +
+                    candidates[i].freq_sub / (float)cfg->freq_osr) / mon->symbol_period;
+    float time_s = (candidates[i].time_offset +
+                   candidates[i].time_sub / (float)cfg->time_osr) * mon->symbol_period;
+
+    float cand_db = noise_db;
+    {
+      int t_index = candidates[i].time_offset * mon->wf.time_osr + candidates[i].time_sub;
+      int f_index = candidates[i].freq_offset * mon->wf.freq_osr + candidates[i].freq_sub;
+      size_t offset2 = (size_t)t_index * (size_t)mon->wf.block_stride + (size_t)f_index;
+      size_t total2 = (size_t)mon->wf.num_blocks * (size_t)mon->wf.block_stride;
+      if (mon->wf.mag && offset2 < total2) {
+        int scaled = mon->wf.mag[offset2];
+        cand_db = 0.5f * ((float)scaled - 240.0f);
+      }
+    }
+    float snr_db = cand_db - noise_db;
+    int snr_q = (int)lrintf(snr_db / 2.0f) * 2;
+    if (snr_q < -30) snr_q = -30;
+    if (snr_q > 32) snr_q = 32;
+
+    ESP_LOGI(TAG, "Decoded[%d] t=%.2fs f=%.1fHz snr=%d : %s",
+             decodedCount, time_s, freq_hz, snr_q, text);
+
+    // UI de-dupe by displayed text (keep highest SNR)
+    std::string text_str(text);
+    auto it = seen_idx.find(text_str);
+    if (it != seen_idx.end()) {
+      int idx_ui = it->second;
+      if (snr_q > ui_lines[idx_ui].snr) {
+        ui_lines[idx_ui].snr = snr_q;
+        ui_lines[idx_ui].offset_hz = (int)lrintf(freq_hz);
+        ui_lines[idx_ui].slot_id = slot_id;
+        // keep original text, but refresh parsed fields based on it
+        fill_fields_from_text(ui_lines[idx_ui]);
+      }
+      continue;
+    }
+
+    UiRxLine line;
+    line.text = text_str;
+    line.snr = snr_q;
+    line.offset_hz = (int)lrintf(freq_hz);
+    line.slot_id = slot_id;
+
+    time_offsets.push_back(time_s);
+
+    fill_fields_from_text(line);
+
+    // CQ detection (now works because text contains CQ again)
+    if (line.text.rfind("CQ ", 0) == 0 || line.text == "CQ") line.is_cq = true;
+
+    // to-me detection (same behavior as your old code)
+    std::string f1_up = to_upper(line.field1);
+    if (!mycall_up.empty() && f1_up == mycall_up) line.is_to_me = true;
+
+    ui_lines.push_back(line);
+    seen_idx[text_str] = (int)ui_lines.size() - 1;
+
+    log_rxtx_line('R', snr_q, (int)lrintf(freq_hz), text_str, -1);
+
+    decodedCount++;
+    if (decodedCount >= 32) break;
+  }
+
+  if (decodedCount == 0) {
+    ESP_LOGW(TAG, "Candidates present but no messages decoded");
+  }
+
+  // ---- Auto sync RTC (your existing logic) ----
+  if (time_offsets.size() > 3) {
+    std::vector<float> tmp = time_offsets;
+    std::sort(tmp.begin(), tmp.end());
+    float median = tmp[tmp.size() / 2];
+    if (std::fabs(median) > 0.3f) {
+      int delta_ms = (int)lrintf(-median * 1000.0f);
+      if (delta_ms > 320) delta_ms = 320;
+      if (delta_ms < -320) delta_ms = -320;
+      rtc_ms_start -= delta_ms;
+      rtc_last_update -= delta_ms;
+      rtc_update_strings();
+      rtc_sync_to_hw();
+      ESP_LOGI("SYNC", "Applied RTC sync: median=%.2fs delta=%dms", median, delta_ms);
+    } else {
+      ESP_LOGD("SYNC", "Median=%.2fs within threshold; no sync", median);
+    }
+  }
+
+  // ---- group: to-me, CQ, other ----
+  std::vector<UiRxLine> to_me, cqs, others;
+  std::string mycall = to_upper(g_call);
   for (auto& l : ui_lines) {
-    std::string f1 = l.field1;
-    for (auto& ch : f1) ch = toupper((unsigned char)ch);
+    std::string f1 = to_upper(l.field1);
     if (!mycall.empty() && !f1.empty() && f1 == mycall) {
       l.is_to_me = true;
       to_me.push_back(l);
@@ -1626,31 +1649,22 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
     }
   }
 
-  // Auto-sequencing: matches reference architecture
-  // 1. Process decodes (only for to_me messages)
-  // 2. Check if TX ready, set flags
-  // 3. TX trigger happens at slot boundary in check_slot_boundary()
-
-  // Only process decodes when NOT transmitting (matches reference: if !was_txing)
+  // ---- autoseq trigger logic (unchanged idea) ----
   if (!g_was_txing) {
     if (!to_me.empty()) {
-      // Feed all to-me messages to autoseq
       autoseq_on_decodes(to_me);
       g_tx_view_dirty = true;
       g_last_reply_text = to_me.front().text;
     }
 
-    // Check if there's a TX ready from autoseq
     AutoseqTxEntry pending;
     if (autoseq_fetch_pending_tx(pending)) {
-      // TX is ready - set flags for slot boundary trigger
       g_qso_xmit = true;
       g_target_slot_parity = pending.slot_id & 1;
       g_pending_tx = pending;
       g_pending_tx_valid = true;
       ESP_LOGI(TAG, "TX ready: %s parity=%d", pending.text.c_str(), g_target_slot_parity);
     } else if (g_beacon != BeaconMode::OFF) {
-      // No TX ready, beacon on: add CQ and set flags
       enqueue_beacon_cq();
       if (autoseq_fetch_pending_tx(pending)) {
         g_qso_xmit = true;
@@ -1671,10 +1685,7 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
 
   g_rx_lines = merged;
 
-  // Auto-switch to RX screen when decodes arrive
-  if (!merged.empty()) {
-    g_auto_switch_to_rx = true;
-  }
+  if (!merged.empty()) g_auto_switch_to_rx = true;
 
   if (update_ui) {
     ui_set_rx_list(g_rx_lines);
