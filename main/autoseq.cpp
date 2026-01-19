@@ -51,6 +51,7 @@ static void sort_and_clean();
 static bool looks_like_grid(const std::string& s);
 static bool looks_like_report(const std::string& s, int& out);
 static void log_qso_if_needed(QsoContext* ctx);
+static std::string normalize_call_token(const std::string& s);
 
 // ============== Public API ==============
 
@@ -124,22 +125,19 @@ void autoseq_on_touch(const UiRxLine& msg) {
 
     QsoContext* ctx = append_ctx();
 
-    // Determine the DX callsign from the message (normalize to uppercase)
+    // Determine the DX callsign from the message (normalize to handle <> wrapped hashed calls)
     std::string dxcall;
     if (!msg.field2.empty()) {
-        dxcall = msg.field2;  // field2 is the sender
+        dxcall = normalize_call_token(msg.field2);  // field2 is the sender
     } else if (!msg.field1.empty() && msg.field1 != "CQ") {
-        dxcall = msg.field1;
+        dxcall = normalize_call_token(msg.field1);
     }
-    for (auto& ch : dxcall) ch = toupper((unsigned char)ch);
 
-    // Check if it's addressed to me
-    std::string f1_upper = msg.field1;
-    for (auto& ch : f1_upper) ch = toupper((unsigned char)ch);
-    std::string my_upper = s_my_call;
-    for (auto& ch : my_upper) ch = toupper((unsigned char)ch);
+    // Check if it's addressed to me (normalize to handle <> wrapped hashed calls)
+    std::string f1_norm = normalize_call_token(msg.field1);
+    std::string my_norm = normalize_call_token(s_my_call);
 
-    if (!my_upper.empty() && f1_upper == my_upper) {
+    if (!my_norm.empty() && f1_norm == my_norm) {
         generate_response(ctx, msg, true);
         sort_and_clean();
         return;
@@ -486,10 +484,9 @@ static bool generate_response(QsoContext* ctx, const UiRxLine& msg, bool overrid
         ctx->snr_tx = msg.snr;
     }
 
-    // Get DX callsign from field2 (the sender), normalize to uppercase
-    std::string dxcall = msg.field2;
-    if (dxcall.empty()) dxcall = msg.field1;
-    for (auto& ch : dxcall) ch = toupper((unsigned char)ch);
+    // Get DX callsign from field2 (the sender), normalize to handle <> wrapped hashed calls
+    std::string dxcall = normalize_call_token(msg.field2);
+    if (dxcall.empty()) dxcall = normalize_call_token(msg.field1);
 
     if (override) {
         ctx->dxcall = dxcall;
@@ -610,19 +607,16 @@ static bool generate_response(QsoContext* ctx, const UiRxLine& msg, bool overrid
 }
 
 static void on_decode(const UiRxLine& msg) {
-    // Check if it's addressed to us
-    std::string f1_upper = msg.field1;
-    for (auto& ch : f1_upper) ch = toupper((unsigned char)ch);
-    std::string my_upper = s_my_call;
-    for (auto& ch : my_upper) ch = toupper((unsigned char)ch);
+    // Check if it's addressed to us (normalize to handle <> wrapped hashed calls)
+    std::string f1_norm = normalize_call_token(msg.field1);
+    std::string my_norm = normalize_call_token(s_my_call);
 
-    if (my_upper.empty() || f1_upper != my_upper) {
+    if (my_norm.empty() || f1_norm != my_norm) {
         return;
     }
 
-    // Get DX call from field2 (normalize to uppercase for comparison)
-    std::string dxcall = msg.field2;
-    for (auto& ch : dxcall) ch = toupper((unsigned char)ch);
+    // Get DX call from field2 (normalize to handle <> wrapped hashed calls)
+    std::string dxcall = normalize_call_token(msg.field2);
     if (dxcall.empty()) return;
 
     // Check if it matches an existing context (case-insensitive)
@@ -747,4 +741,16 @@ static bool looks_like_report(const std::string& s, int& out) {
 
     out = neg ? -val : val;
     return true;
+}
+
+// Normalize a callsign token: strip <> wrappers used for hashed nonstd calls
+// and convert to uppercase
+static std::string normalize_call_token(const std::string& s) {
+    std::string out = s;
+    // Trim <> wrappers used for hashed nonstd calls
+    if (!out.empty() && out.front() == '<') out.erase(out.begin());
+    if (!out.empty() && out.back()  == '>') out.pop_back();
+    // Convert to uppercase
+    for (auto& ch : out) ch = (char)toupper((unsigned char)ch);
+    return out;
 }
