@@ -523,7 +523,7 @@ static std::string g_call = "AG6AQ";
 static std::string g_grid = "CM97";
 bool g_decode_enabled = true;
 static OffsetSrc g_offset_src = OffsetSrc::RANDOM;
-static RadioType g_radio = RadioType::NONE;
+static RadioType g_radio = RadioType::QMX;
 static std::string g_ant = "EFHW";
 static std::string g_comment1 = "MiniFT8 /Radio /Ant";
 static bool g_rxtx_log = true;
@@ -735,7 +735,7 @@ static void log_adif_entry(const std::string& dxcall, const std::string& dxgrid,
   // Expand placeholders using current radio/ant strings
   auto radio_name_local = [](RadioType r) {
     switch (r) {
-      case RadioType::TRUSDX: return "TRUSDX";
+      case RadioType::TRUSDX: return "QMX";
       case RadioType::QMX: return "QMX";
       default: return "None";
     }
@@ -999,8 +999,8 @@ static const char* offset_name(OffsetSrc o) {
 
 static const char* radio_name(RadioType r) {
   switch (r) {
-    case RadioType::NONE: return "None";
-    case RadioType::TRUSDX: return "truSDX";
+    case RadioType::NONE: return "QMX";
+    case RadioType::TRUSDX: return "QMX";
     case RadioType::QMX: return "QMX";
   }
   return "None";
@@ -2608,7 +2608,7 @@ static void load_station_data() {
     } else if (sscanf(line, "offset_src=%d", &val) == 1) {
       if (val >= 0 && val <= 2) g_offset_src = (OffsetSrc)val;
     } else if (sscanf(line, "radio=%d", &val) == 1) {
-      if (val >= 0 && val <= 3) g_radio = (RadioType)val;
+      if (val >= 0 && val <= 2) g_radio = (RadioType)val;
     } else if (strncmp(line, "cq_ft=", 6) == 0) {
       g_cq_freetext = trim_copy(line + 6);
     } else if (strncmp(line, "free_text=", 10) == 0) {
@@ -3496,7 +3496,7 @@ static void app_task_core0(void* /*param*/) {
                   menu_edit_buf = std::to_string(g_offset_hz);
                   draw_menu_view();
                 } else if (c == '3') {
-                  g_radio = (RadioType)(((int)g_radio + 1) % 4);
+                  g_radio = (RadioType)(((int)g_radio + 1) % 3);
                   save_station_data();
                   draw_menu_view();
                 } else if (c == '4') {
@@ -3582,5 +3582,6 @@ static void draw_battery_icon(int x, int y, int w, int h, int level, bool chargi
   }
   M5.Display.endWrite();
 }
+
 
 
