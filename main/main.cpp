@@ -1448,14 +1448,14 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
     noise_db = 0.5f * ((float)noise_scaled - 240.0f);
   }
 
-  static float snr_to_2500 = 0.0f;
-  static bool snr_to_2500_init = false;
+  //static float snr_to_2500 = 0.0f;
+  //static bool snr_to_2500_init = false;
 
-  if (!snr_to_2500_init) {
-    float bw_eff = 1.5f / (mon->symbol_period * cfg->freq_osr); // Hz
-    snr_to_2500 = 10.0f * log10f(bw_eff / 2500.0f);
-    snr_to_2500_init = true;
-  }
+  //if (!snr_to_2500_init) {
+  //  float bw_eff = 1.5f / (mon->symbol_period * cfg->freq_osr); // Hz
+  //  snr_to_2500 = 10.0f * log10f(bw_eff / 2500.0f);
+  //  snr_to_2500_init = true;
+  //}
 
   auto to_upper = [](std::string s) {
     for (auto& ch : s) ch = (char)toupper((unsigned char)ch);
@@ -1583,7 +1583,9 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
       }
     }
     
-    float snr_db = (cand_db - noise_db) + snr_to_2500 + 30; //add 30 as calibration
+    //float snr_db = (cand_db - noise_db) + snr_to_2500;
+    float snr_db = (cand_db - noise_db);
+
     int snr_q = (int)lrintf(snr_db);
     if (snr_q < -30) snr_q = -30;
     if (snr_q >  99) snr_q = 99;
