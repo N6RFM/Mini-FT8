@@ -1412,6 +1412,7 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
   int num_candidates = ftx_find_candidates(&mon->wf, max_cand, candidates, 5);
   ESP_LOGI(TAG, "Candidates found: %d", num_candidates);
 
+
   // ---- slot index + once-per-slot hashtable maintenance ----
   int64_t slot_idx = -1;
   if (g_decode_slot_idx >= 0) {
@@ -1428,13 +1429,16 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
     hashtable_age_all();
   }
 
-  // ---- estimate noise floor (your existing approach) ----
+  // ---- estimate noise floor ----
   float noise_db = -120.0f;
   if (mon->wf.mag && mon->wf.num_blocks > 0) {
     const size_t total = (size_t)mon->wf.num_blocks * (size_t)mon->wf.block_stride;
-    static uint32_t hist[256] = {0};
+    static uint32_t hist[256];
+    memset(hist, 0, sizeof(hist));               // <-- FIX
+
     for (size_t i = 0; i < total; ++i) hist[mon->wf.mag[i]]++;
-    uint64_t target = total / 3;  // 33th percentile
+
+    uint64_t target = total * 25 / 100;          // <-- use lower percentile than median
     uint64_t accum = 0;
     int noise_scaled = 0;
     for (int v = 0; v < 256; ++v) {
@@ -1442,6 +1446,15 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
       if (accum >= target) { noise_scaled = v; break; }
     }
     noise_db = 0.5f * ((float)noise_scaled - 240.0f);
+  }
+
+  static float snr_to_2500 = 0.0f;
+  static bool snr_to_2500_init = false;
+
+  if (!snr_to_2500_init) {
+    float bw_eff = 1.5f / (mon->symbol_period * cfg->freq_osr); // Hz
+    snr_to_2500 = 10.0f * log10f(bw_eff / 2500.0f);
+    snr_to_2500_init = true;
   }
 
   auto to_upper = [](std::string s) {
@@ -1569,10 +1582,11 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
         cand_db = 0.5f * ((float)scaled - 240.0f);
       }
     }
-    float snr_db = cand_db - noise_db;
-    int snr_q = (int)lrintf(snr_db / 2.0f) * 2;
+    
+    float snr_db = (cand_db - noise_db) + snr_to_2500 + 30; //add 30 as calibration
+    int snr_q = (int)lrintf(snr_db);
     if (snr_q < -30) snr_q = -30;
-    if (snr_q > 32) snr_q = 32;
+    if (snr_q >  99) snr_q = 99;
 
     ESP_LOGI(TAG, "Decoded[%d] t=%.2fs f=%.1fHz snr=%d : %s",
              decodedCount, time_s, freq_hz, snr_q, text);
