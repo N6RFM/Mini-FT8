@@ -101,7 +101,7 @@ void ui_init() {
     M5Cardputer.begin(cfg, true);
     M5.Display.setRotation(1);
     M5.Display.fillScreen(TFT_BLACK);
-    ui_draw_countdown(0.0f, true);
+    ui_draw_countdown(0.0f, true, 1500);
 }
 
 void ui_set_waterfall_row(int row, const uint8_t* bins, int len) {
@@ -149,7 +149,38 @@ void ui_draw_waterfall() {
     }
 }
 
-void ui_draw_countdown(float fraction, bool even_slot) {
+static inline int hz_to_x(int hz) {
+    // clamp to waterfall range
+    if (hz < 200)  hz = 200;
+    if (hz > 3000) hz = 3000;
+
+    // map [200..3000] -> [0..SCREEN_W-1]
+    const int in_min = 200, in_max = 3000;
+    int x = (int)((int64_t)(hz - in_min) * (SCREEN_W - 1) / (in_max - in_min));
+    if (x < 0) x = 0;
+    if (x > SCREEN_W - 1) x = SCREEN_W - 1;
+    return x;
+}
+
+static void ui_draw_offset_cursor_dot(int offset_hz) {
+    const int y = WATERFALL_H;                 // countdown bar top
+    const int cy = y + (COUNTDOWN_H / 2);      // vertically centered in bar
+    int cx = hz_to_x(offset_hz);
+
+    // 3x3 dot centered at (cx, cy)
+    int x0 = cx - 1;
+    int y0 = cy - 1;
+
+    // clamp so we don't draw outside
+    if (x0 < 0) x0 = 0;
+    if (y0 < y) y0 = y;
+    if (x0 + 3 > SCREEN_W) x0 = SCREEN_W - 3;
+    if (y0 + 3 > y + COUNTDOWN_H) y0 = y + COUNTDOWN_H - 3;
+
+    M5.Display.fillRect(x0, y0, 3, 3, TFT_BLUE);   // white cursor dot
+}
+
+void ui_draw_countdown(float fraction, bool even_slot, int offset_hz) {
     if (fraction < 0.0f) fraction = 0.0f;
     if (fraction > 1.0f) fraction = 1.0f;
     int filled = (int)(fraction * SCREEN_W);
@@ -161,6 +192,8 @@ void ui_draw_countdown(float fraction, bool even_slot) {
         uint16_t color = even_slot ? rgb565(0, 180, 0) : rgb565(180, 0, 0);
         M5.Display.fillRect(0, y, filled, COUNTDOWN_H, color);
     }
+    // draw cursor last so countdown never overwrites it
+    ui_draw_offset_cursor_dot(offset_hz);
 }
 
 void ui_set_rx_list(const std::vector<UiRxLine>& lines) {

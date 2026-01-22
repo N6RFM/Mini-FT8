@@ -1192,7 +1192,7 @@ static void update_countdown() {
   if (slot_idx != last_slot_idx || sec != last_sec) {
     float frac = (float)slot_ms / 15000.0f;
     bool even = (slot_idx % 2) == 0;
-    ui_draw_countdown(frac, even);
+    ui_draw_countdown(frac, even, g_offset_hz);
     last_slot_idx = slot_idx;
     last_sec = sec;
   }

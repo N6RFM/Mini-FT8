@@ -24,7 +24,7 @@ void ui_clear_waterfall();
 void ui_draw_waterfall();
 void ui_draw_waterfall_if_dirty();
 bool ui_waterfall_dirty();
-void ui_draw_countdown(float fraction, bool even_slot);  // 0.0-1.0 fill of the countdown bar
+void ui_draw_countdown(float fraction, bool even_slot, int offset_hz);  // 0.0-1.0 fill of the countdown bar
 void ui_set_rx_list(const std::vector<UiRxLine>& lines);
 void ui_set_paused(bool paused);
 bool ui_is_paused();
