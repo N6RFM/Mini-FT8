@@ -151,8 +151,8 @@ void ui_draw_waterfall() {
 
 static inline int hz_to_x(int hz) {
     // clamp to waterfall range
-    if (hz < 200)  hz = 200;
-    if (hz > 3000) hz = 3000;
+    //if (hz < 200)  hz = 200;
+    //if (hz > 3000) hz = 3000;
 
     // map [200..3000] -> [0..SCREEN_W-1]
     const int in_min = 200, in_max = 3000;
@@ -177,7 +177,8 @@ static void ui_draw_offset_cursor_dot(int offset_hz) {
     if (x0 + 3 > SCREEN_W) x0 = SCREEN_W - 3;
     if (y0 + 3 > y + COUNTDOWN_H) y0 = y + COUNTDOWN_H - 3;
 
-    M5.Display.fillRect(x0, y0, 5, 3, TFT_BLUE);   // blue cursor dot
+    if(offset_hz>=200 && offset_hz <=3000)
+      M5.Display.fillRect(x0, y0, 5, 3, TFT_BLUE);   // blue cursor dot
 }
 
 void ui_draw_countdown(float fraction, bool even_slot, int offset_hz) {
