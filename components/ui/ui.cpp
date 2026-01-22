@@ -177,7 +177,7 @@ static void ui_draw_offset_cursor_dot(int offset_hz) {
     if (x0 + 3 > SCREEN_W) x0 = SCREEN_W - 3;
     if (y0 + 3 > y + COUNTDOWN_H) y0 = y + COUNTDOWN_H - 3;
 
-    M5.Display.fillRect(x0, y0, 3, 3, TFT_BLUE);   // white cursor dot
+    M5.Display.fillRect(x0, y0, 5, 3, TFT_BLUE);   // blue cursor dot
 }
 
 void ui_draw_countdown(float fraction, bool even_slot, int offset_hz) {
