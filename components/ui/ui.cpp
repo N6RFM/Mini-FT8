@@ -178,7 +178,8 @@ static void ui_draw_offset_cursor_dot(int offset_hz) {
     if (y0 + 3 > y + COUNTDOWN_H) y0 = y + COUNTDOWN_H - 3;
 
     if(offset_hz>=200 && offset_hz <=3000)
-      M5.Display.fillRect(x0, y0, 5, 3, TFT_BLUE);   // blue cursor dot
+      //M5.Display.fillRect(x0, y0, 5, 3, TFT_BLUE);   // blue cursor dot
+      M5.Display.fillRect(x0, y0, 3, 3, rgb565(0, 80, 160)); //softer dim blue
 }
 
 void ui_draw_countdown(float fraction, bool even_slot, int offset_hz) {
