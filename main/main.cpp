@@ -3092,7 +3092,7 @@ static void app_task_core0(void* /*param*/) {
       }
       else if (c == 'q' || c == 'Q') { cancel_status_edit(); enter_mode(ui_mode == UIMode::QSO ? UIMode::RX : UIMode::QSO); switched = true; }
       else if (c == 'h' || c == 'H') { cancel_status_edit(); set_log_to_soft_uart(true); enter_mode(ui_mode == UIMode::HOST ? UIMode::RX : UIMode::HOST); switched = true; }
-      else if (c == 'c' || c == 'C') { cancel_status_edit(); set_log_to_soft_uart(false); enter_mode(ui_mode == UIMode::CONTROL ? UIMode::RX : UIMode::CONTROL); switched = true; }
+      else if (c == '0x03' || c == 'C') { cancel_status_edit(); set_log_to_soft_uart(false); enter_mode(ui_mode == UIMode::CONTROL ? UIMode::RX : UIMode::CONTROL); switched = true; }
       else if (c == 'd' || c == 'D') { cancel_status_edit(); enter_mode(ui_mode == UIMode::DEBUG ? UIMode::RX : UIMode::DEBUG); switched = true; }
       else if (c == 'l' || c == 'L') { cancel_status_edit(); enter_mode(ui_mode == UIMode::LIST ? UIMode::RX : UIMode::LIST); switched = true; }
       else if (c == 's' || c == 'S') { cancel_status_edit(); enter_mode(ui_mode == UIMode::STATUS ? UIMode::RX : UIMode::STATUS); switched = true; }
