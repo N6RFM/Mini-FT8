@@ -9,8 +9,11 @@
 #include <algorithm>
 #include <cstring>
 #include <cstdio>
+#include <cstdarg>
 #include "esp_log.h"
+#include <string>
 
+//void debug_log_line_public(const std::string& msg);
 static const char* TAG = "AUTOSEQ";
 
 // ============== Internal state ==============
@@ -66,6 +69,17 @@ void autoseq_init() {
 void autoseq_clear() {
     autoseq_init();
 }
+
+/*
+static void dlogf(const char* fmt, ...) {
+  char b[128];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(b, sizeof(b), fmt, ap);
+  va_end(ap);
+  debug_log_line_public(b);
+}
+*/
 
 bool autoseq_drop_index(int idx) {
     if (idx < 0 || idx >= s_queue_size) return false;
@@ -148,16 +162,29 @@ void autoseq_on_touch(const UiRxLine& msg) {
     if (looks_like_grid(msg.field3)) {
         ctx->dxgrid = msg.field3;
     }
+    //dlogf("r:=%d %s %s %s",
+    //  msg.snr, msg.field1.c_str(), msg.field2.c_str(), msg.field3.c_str());
+    //dlogf("s:=%d", ctx->snr_tx);
+
     ctx->snr_tx = msg.snr;  // Our measurement of their signal
     ctx->offset_hz = msg.offset_hz;
     ctx->slot_id = msg.slot_id ^ 1;  // TX on opposite slot
+
+    //dlogf("TH: %s %s %s snr=%d",
+    //  msg.field1.c_str(), msg.field2.c_str(), msg.field3.c_str(), msg.snr);
+
+    //dlogf("TH: bf snr_tx=%d skip=%d",
+    //  ctx->snr_tx, (int)s_skip_tx1);
 
     set_state(ctx, s_skip_tx1 ? AutoseqState::REPORT : AutoseqState::REPLYING,
               s_skip_tx1 ? TxMsgType::TX2 : TxMsgType::TX1, AUTOSEQ_MAX_RETRY);
     sort_and_clean();
 
-    ESP_LOGI(TAG, "Touch: %s grid=%s snr=%d", ctx->dxcall.c_str(),
-             ctx->dxgrid.c_str(), ctx->snr_tx);
+    //dlogf("TH: af snr_tx=%d state=%d",
+    //  ctx->snr_tx, (int)ctx->state);
+
+    //ESP_LOGI(TAG, "Touch: %s grid=%s snr=%d", ctx->dxcall.c_str(),
+    //         ctx->dxgrid.c_str(), ctx->snr_tx);
 }
 
 void autoseq_on_decodes(const std::vector<UiRxLine>& to_me_messages) {

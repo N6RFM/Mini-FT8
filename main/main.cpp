@@ -435,6 +435,11 @@ static std::vector<std::string> g_debug_lines;
 static int debug_page = 0;
 static const size_t DEBUG_MAX_LINES = 18; // 3 pages
 static void debug_log_line(const std::string& msg);
+//exported symbol (linkable from other .cpp)
+void debug_log_line_public(const std::string& msg) {
+  debug_log_line(msg);
+}
+
 static void host_handle_line(const std::string& line);
 // TX entry for display and scheduling (populated by autoseq)
 static AutoseqTxEntry g_pending_tx;
@@ -2624,7 +2629,7 @@ static void load_station_data() {
     } else if (sscanf(line, "rxtx_log=%d", &val) == 1) {
       g_rxtx_log = (val != 0);
     } else if (sscanf(line, "skiptx1=%d", &val) == 1) {
-      g_skip_tx1 = (val != 0);
+      g_skip_tx1 = (val != 0); autoseq_set_skip_tx1(g_skip_tx1);
     } else if (sscanf(line, "active_band=%d", &val) == 1) { // legacy single value
       g_active_band_text = std::to_string(val);
     } else if (strncmp(line, "active_bands=", 13) == 0) {
@@ -3517,6 +3522,7 @@ static void app_task_core0(void* /*param*/) {
                 draw_menu_view();
               } else if (c == '2') {
                 g_skip_tx1 = !g_skip_tx1;
+                autoseq_set_skip_tx1(g_skip_tx1);
                 save_station_data();
                 draw_menu_view();
               } else if (c == '3') {
