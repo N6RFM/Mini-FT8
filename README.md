@@ -1,4 +1,4 @@
-Join [https://groups.io/g/qrp-portable](https://groups.io/g/qrp-portable) for announcements,updates & discussion
+[User Manual](https://github.com/wcheng95/Mini-FT8/blob/main/release/Mini-FT8%20User%20Manual.pdf), Join [https://groups.io/g/qrp-portable](https://groups.io/g/qrp-portable) for announcements,updates & discussion
 
 # First POTA activation (v1.0 2025-12-31)
 ![First POTA Activation](IMG_6087.jpeg)
