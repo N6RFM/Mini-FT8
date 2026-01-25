@@ -1180,7 +1180,7 @@ static void rtc_tick() {
           draw_status_line(4, std::string("Date: ") + g_date, false);
         }
         if (old_time != g_time) {
-          draw_status_line(5, std::string("Time: ") + g_time, false);
+          draw_status_line(5, std::string("UTC:  ") + g_time, false);
         }
       }
     }
@@ -2164,9 +2164,9 @@ static void draw_status_view() {
     lines[4] = std::string("Date: ") + g_date;
   }
   if (status_edit_idx == 5 && !status_edit_buffer.empty()) {
-    lines[5] = std::string("Time: ") + highlight_pos(status_edit_buffer, status_cursor_pos);
+    lines[5] = std::string("UTC: ") + highlight_pos(status_edit_buffer, status_cursor_pos);
   } else {
-    lines[5] = std::string("Time: ") + g_time;
+    lines[5] = std::string("UTC: ") + g_time;
   }
   for (int i = 0; i < 6; ++i) {
     bool hl = (status_edit_idx == i);
