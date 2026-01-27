@@ -228,7 +228,7 @@ static int gap_cb(struct ble_gap_event *event, void *arg)
 [[maybe_unused]] static uint8_t ble_tx_placeholder = 0;
 #endif // ENABLE_BLE
 
-#define CALLSIGN_HASHTABLE_SIZE 128
+#define CALLSIGN_HASHTABLE_SIZE 256
 
 static struct
 {
@@ -303,7 +303,7 @@ void hashtable_add(const char* callsign, uint32_t hash)
     while (callsign_hashtable_size >= CALLSIGN_HASHTABLE_SIZE)
     {
         // Table is full; evict down to the target size to make room
-        hashtable_trim_size(230);
+        hashtable_trim_size(CALLSIGN_HASHTABLE_SIZE-50);
         if (callsign_hashtable_size >= CALLSIGN_HASHTABLE_SIZE)
         {
             LOG(LOG_INFO, "Hash table full; ignoring new callsign [%s]\n", callsign);
@@ -2405,7 +2405,6 @@ static void host_handle_line(const std::string& line_in) {
     send("OK");
   } else if (cmd_up == "HELP") {
     for (auto& l : g_ctrl_lines) send(l);
-    send("RX decode: press 'x' in RX to stream /kfs40m.wav");
   } else if (cmd_up == "EXIT") {
     send("OK: exit host");
     enter_mode(UIMode::RX);
@@ -3588,6 +3587,7 @@ static void draw_battery_icon(int x, int y, int w, int h, int level, bool chargi
   }
   M5.Display.endWrite();
 }
+
 
 
 
