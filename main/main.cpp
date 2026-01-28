@@ -1,3 +1,5 @@
+#define DEBUG_LOG 1
+
 #include <cstdio>
 #include <cmath>
 #include "esp_log.h"
@@ -228,6 +230,12 @@ static int gap_cb(struct ble_gap_event *event, void *arg)
 [[maybe_unused]] static uint8_t ble_tx_placeholder = 0;
 #endif // ENABLE_BLE
 
+static void debug_log_line(const std::string& msg);
+//exported symbol (linkable from other .cpp)
+void debug_log_line_public(const std::string& msg) {
+  debug_log_line(msg);
+}
+
 #define CALLSIGN_HASHTABLE_SIZE 256
 
 static struct
@@ -259,6 +267,7 @@ static void hashtable_age_all(void)
             }
         }
     }
+
 }
 
 // Trim the hash table if it grows too large by evicting the oldest entries
@@ -346,6 +355,7 @@ void hashtable_add(const char* callsign, uint32_t hash)
     strncpy(callsign_hashtable[idx_hash].callsign, callsign, 11);
     callsign_hashtable[idx_hash].callsign[11] = '\0';
     callsign_hashtable[idx_hash].hash = hash_payload;
+
 }
 
 bool hashtable_lookup(ftx_callsign_hash_type_t hash_type, uint32_t hash, char* callsign)
@@ -434,11 +444,6 @@ static void host_send_bt(const std::string& s);
 static std::vector<std::string> g_debug_lines;
 static int debug_page = 0;
 static const size_t DEBUG_MAX_LINES = 18; // 3 pages
-static void debug_log_line(const std::string& msg);
-//exported symbol (linkable from other .cpp)
-void debug_log_line_public(const std::string& msg) {
-  debug_log_line(msg);
-}
 
 static void host_handle_line(const std::string& line);
 // TX entry for display and scheduling (populated by autoseq)
@@ -523,8 +528,8 @@ enum class RadioType { NONE, TRUSDX, QMX };
 static CqType g_cq_type = CqType::CQ;
 static std::string g_cq_freetext = "FreeText";
 static bool g_skip_tx1 = false;
-static std::string g_free_text = "DE AG6AQ CM97";
-static std::string g_call = "AG6AQ";
+static std::string g_free_text = "TNX 73";
+static std::string g_call = "YOURCALL";
 static std::string g_grid = "CM97";
 bool g_decode_enabled = true;
 static OffsetSrc g_offset_src = OffsetSrc::RANDOM;
@@ -1726,6 +1731,13 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
   } else {
     g_rx_dirty = true;
   }
+
+#ifdef DEBUG_LOG
+    char buf[32];
+    snprintf(buf, sizeof(buf), "HashTableSize %d", callsign_hashtable_size);
+    debug_log_line_public(buf);
+#endif
+
 }
 
 static void draw_menu_long_edit() {
