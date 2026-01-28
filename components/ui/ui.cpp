@@ -13,7 +13,7 @@ static constexpr int RX_LINES = 6;
 static bool ui_paused = false;      // waterfall updates paused
 
 static std::vector<std::string> g_startup_lines = {
-    "Mini-FT8 V1.3.2",
+    "Mini-FT8 V1.3.1",
     "S - Status(Operate)",
     "R - Rx page",
     "T - Tx page",
@@ -350,4 +350,5 @@ void ui_draw_debug(const std::vector<std::string>& lines, int page) {
     }
     M5.Display.endWrite();
 }
+
 
