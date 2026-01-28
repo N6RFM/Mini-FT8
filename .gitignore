@@ -19,3 +19,6 @@ __pycache__/
 *.log
 
 !release/*.bin
+
+managed_components/
+release/20
