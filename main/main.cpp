@@ -11,7 +11,7 @@ extern "C" {
   #include "ft8/encode.h"
   #include "ft8/debug.h"
   #include "common/monitor.h"
-}
+  }
 
 #include "ui.h"
 #include <vector>
@@ -488,6 +488,18 @@ static std::vector<std::string> g_ctrl_lines = {
     "LIST/INFO/HELP",
     "EXIT to leave"
 };
+
+static std::vector<std::string> g_startup_lines = {
+    "Mini-FT8 V1.3.1",
+    "S: Status(Operate)",
+    "R: Rx page",
+    "T: Tx page",
+    "M: Menu(Setting)",
+    "Other: Q/C/B/N/O/D"
+};
+
+// Runtime latch: when true, we keep showing the startup screen until any key is pressed.
+static bool g_startup_active = true;
 static std::vector<std::string> g_q_lines;
 static std::vector<std::string> g_q_files;
 static bool g_q_show_entries = false;
@@ -2841,10 +2853,6 @@ static void app_task_core0(void* /*param*/) {
   init_soft_uart();
   ui_init();
   hashtable_init();
-  
-  std::vector<UiRxLine> empty;
-  ui_set_rx_list(empty);
-  ui_draw_rx();
 
   // Initialize autoseq engine
   autoseq_init();
@@ -2856,6 +2864,17 @@ static void app_task_core0(void* /*param*/) {
 
   // Update autoseq with station info after loading
   autoseq_set_station(g_call, g_grid);
+
+  // Prepare RX list (but don't draw yet - startup screen may be shown)
+  std::vector<UiRxLine> empty;
+  ui_set_rx_list(empty);
+
+  if (g_startup_active) {
+    ui_draw_list(g_startup_lines, 0, -1);
+  } else {
+    ui_force_redraw_rx();
+    ui_draw_rx();
+  }
 
   ESP_LOGI(TAG, "Free heap: %u, internal: %u, 8bit: %u",
            heap_caps_get_free_size(MALLOC_CAP_DEFAULT),
@@ -2882,6 +2901,29 @@ static void app_task_core0(void* /*param*/) {
       c = 0x7f;  // treat delete/backspace
     } else if (state.enter) {
       c = '\n';  // enter/return
+    }
+    // Startup screen overlay on RX page: show until any key press, and only once
+    if (g_startup_active) {
+      if (c == 0) {
+        last_key = 0;
+        vTaskDelay(pdMS_TO_TICKS(10));
+        continue;
+      }
+      if (c == last_key) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+        continue;
+      }
+      last_key = c;
+
+      g_startup_active = false;
+      save_station_data();
+
+      // Now show the real RX page; consume this key so it doesn't trigger actions.
+      ui_force_redraw_rx();
+      ui_draw_rx();
+
+      vTaskDelay(pdMS_TO_TICKS(10));
+      continue;
     }
 
     rtc_tick();
