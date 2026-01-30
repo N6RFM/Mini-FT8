@@ -1,22 +1,35 @@
-# PowerShell helper to flash Mini-FT8 (8MB flash, 4MB SPIFFS)
-# Usage:
-#   1) pip install esptool
-#   2) Edit $Port below to match your device (e.g., COM11)
-#   3) .\flash.ps1
+# Flash Mini-FT8 merged firmware image (ESP32-S3, 8MB)
+# Requires: pip install esptool
+# Usage: .\flash.ps1
 
 $ErrorActionPreference = "Stop"
 
-$Port = "COM11"  # TODO: change to your COM port
-$Baud = 460800
-$Chip = "esp32s3"
-
-$Bootloader = "bootloader.bin"
-$Partition  = "partition-table.bin"
-$App        = "mini_ft8.bin"
-
-if (!(Test-Path $Bootloader) -or !(Test-Path $Partition) -or !(Test-Path $App)) {
-    Write-Error "Build artifacts not found. Run 'idf.py build' first."
+function Require-NonEmpty([string]$Prompt) {
+    while ($true) {
+        $v = Read-Host $Prompt
+        if (-not [string]::IsNullOrWhiteSpace($v)) { return $v }
+        Write-Host "Value required." -ForegroundColor Red
+    }
 }
+
+function Resolve-ExistingPath([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path)) {
+        throw "File not found: $Path"
+    }
+    return (Resolve-Path -LiteralPath $Path).Path
+}
+
+$Chip = "esp32s3"
+$Baud = 460800
+
+Write-Host "Mini-FT8 flasher (merged .bin)" -ForegroundColor Cyan
+Write-Host ""
+
+$PortIn = Require-NonEmpty "Enter serial port (e.g., COM11)"
+$BinIn  = Require-NonEmpty "Enter merged firmware .bin path (e.g., MiniFT8_V1.3.2.bin)"
+
+$Port = $PortIn.Trim()
+$Bin  = Resolve-ExistingPath $BinIn.Trim()
 
 $Args = @(
     "--chip", $Chip,
@@ -28,10 +41,10 @@ $Args = @(
     "--flash_mode", "dio",
     "--flash_size", "8MB",
     "--flash_freq", "80m",
-    "0x0",     $Bootloader,
-    "0x8000",  $Partition,
-    "0x10000", $App
+    "0x0", $Bin
 )
 
-Write-Host "Flashing $Chip on $Port @ $Baud..."
+Write-Host ""
+Write-Host "Flashing $Chip on $Port @ $Baud..." -ForegroundColor Green
+Write-Host "  File: $Bin"
 esptool @Args
