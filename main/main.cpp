@@ -11,7 +11,7 @@ extern "C" {
   #include "ft8/encode.h"
   #include "ft8/debug.h"
   #include "common/monitor.h"
-}
+  }
 
 #include "ui.h"
 #include <vector>
@@ -33,6 +33,7 @@ extern "C" {
 #include <algorithm>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <unistd.h>
 #include <memory>
 #include "driver/usb_serial_jtag.h"
 #include "driver/uart.h"
@@ -46,6 +47,11 @@ extern "C" {
 #include "esp_timer.h"
 #include "esp_sleep.h"
 #include "stream_uac.h"
+
+#include "driver/spi_master.h"
+#include "driver/sdspi_host.h"
+#include "sdmmc_cmd.h"
+#include "esp_vfs_fat.h"
 
 #define ENABLE_BLE 0
 
@@ -234,6 +240,180 @@ static void debug_log_line(const std::string& msg);
 //exported symbol (linkable from other .cpp)
 void debug_log_line_public(const std::string& msg) {
   debug_log_line(msg);
+}
+
+//static const char *TAG = "sdtest";
+
+#define PIN_NUM_MISO GPIO_NUM_39
+#define PIN_NUM_MOSI GPIO_NUM_14
+#define PIN_NUM_CLK  GPIO_NUM_40
+#define PIN_NUM_CS   GPIO_NUM_12
+
+void mount_sd_spi(void)
+{
+    esp_err_t ret;
+    const char mount_point[] = "/sdcard";
+
+    // 1) Init SPI bus
+    spi_bus_config_t bus_cfg = {
+        .mosi_io_num = PIN_NUM_MOSI,
+        .miso_io_num = PIN_NUM_MISO,
+        .sclk_io_num = PIN_NUM_CLK,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = 4000,
+    };
+
+    // Pick an SPI host; SPI2_HOST is commonly available on ESP32-S3.
+    ret = spi_bus_initialize(SPI2_HOST, &bus_cfg, SPI_DMA_CH_AUTO);
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+        //ESP_LOGE(TAG, "spi_bus_initialize failed: %s", esp_err_to_name(ret));
+
+#ifdef DEBUG_LOG
+    char buf[32];
+    snprintf(buf, sizeof(buf), "SPI_INIT Failed: %s", esp_err_to_name(ret));
+    debug_log_line_public(buf);
+#endif
+        return;
+    }
+
+    // 2) Configure SDSPI device
+    sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
+    slot_config.gpio_cs = PIN_NUM_CS;
+    slot_config.host_id = SPI2_HOST;
+
+    // 3) Mount FAT filesystem
+    esp_vfs_fat_mount_config_t mount_config = {
+        .format_if_mount_failed = false,   // keep false until you're sure
+        .max_files = 5,
+        .allocation_unit_size = 16 * 1024
+    };
+
+    sdmmc_host_t host = SDSPI_HOST_DEFAULT();
+    // If you had flaky mounts, try slowing SPI down:
+    host.max_freq_khz = 5000;  // 10 MHz (try 5000 if still flaky)
+
+    sdmmc_card_t *card;
+    ret = esp_vfs_fat_sdspi_mount(mount_point, &host, &slot_config, &mount_config, &card);
+    if (ret != ESP_OK) {
+        //ESP_LOGE(TAG, "Mount failed: %s", esp_err_to_name(ret));
+#ifdef DEBUG_LOG
+    char buf[32];
+    snprintf(buf, sizeof(buf), "sd %x %s", (unsigned)ret, esp_err_to_name(ret));
+    debug_log_line_public(buf);
+#endif
+
+        return;
+    }
+
+    sdmmc_card_print_info(stdout, card);
+    //ESP_LOGI(TAG, "Mounted at %s", mount_point);
+#ifdef DEBUG_LOG
+    char buf[32];
+    snprintf(buf, sizeof(buf), "Mounted at %s", mount_point);
+    debug_log_line_public(buf);
+#endif
+
+}
+
+void unmount_sd_spi(const char *mount_point)
+{
+    esp_vfs_fat_sdcard_unmount(mount_point, NULL);
+}
+
+// ---------- Log copy/delete helpers ----------
+static bool sdcard_is_mounted() {
+  struct stat st;
+  return (stat("/sdcard", &st) == 0) && S_ISDIR(st.st_mode);
+}
+
+static esp_err_t ensure_sdcard_mounted() {
+  if (sdcard_is_mounted()) return ESP_OK;
+  mount_sd_spi();
+  if (sdcard_is_mounted()) return ESP_OK;
+  return ESP_FAIL;
+}
+
+static bool ends_with_adi(const char* name) {
+  size_t n = strlen(name);
+  return (n >= 4) && (strcasecmp(name + (n - 4), ".adi") == 0);
+}
+
+static bool is_log_file_on_spiffs(const char* name) {
+  if (!name) return false;
+  if (ends_with_adi(name)) return true;
+  return (strcmp(name, "RxTxLog.txt") == 0) || (strcmp(name, "StationData.ini") == 0);
+}
+
+static esp_err_t copy_file_overwrite(const char* src_path, const char* dst_path) {
+  FILE* fs = fopen(src_path, "rb");
+  if (!fs) return ESP_FAIL;
+  FILE* fd = fopen(dst_path, "wb");  // overwrite
+  if (!fd) { fclose(fs); return ESP_FAIL; }
+
+  uint8_t buf[4096];
+  size_t r = 0;
+  while ((r = fread(buf, 1, sizeof(buf), fs)) > 0) {
+    if (fwrite(buf, 1, r, fd) != r) {
+      fclose(fd);
+      fclose(fs);
+      return ESP_FAIL;
+    }
+  }
+  fclose(fd);
+  fclose(fs);
+  return ESP_OK;
+}
+
+// Copy all log files from SPIFFS -> SD card, overwriting destination.
+// Copies: *.adi, RxTxLog.txt, StationData.ini
+static esp_err_t copy_logs_spiffs_to_sd_overwrite() {
+  esp_err_t mret = ensure_sdcard_mounted();
+  if (mret != ESP_OK) return mret;
+
+  DIR* d = opendir("/spiffs");
+  if (!d) return ESP_FAIL;
+
+  struct dirent* ent;
+  while ((ent = readdir(d)) != nullptr) {
+    const char* name = ent->d_name;
+    if (!name || name[0] == '.') continue;
+    if (!is_log_file_on_spiffs(name)) continue;
+
+    // Only regular files
+    std::string src = std::string("/spiffs/") + name;
+    struct stat st;
+    if (stat(src.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) continue;
+
+    std::string dst = std::string("/sdcard/") + name;
+    esp_err_t err = copy_file_overwrite(src.c_str(), dst.c_str());
+    if (err != ESP_OK) {
+      closedir(d);
+      return err;
+    }
+  }
+  closedir(d);
+  return ESP_OK;
+}
+
+// Delete log files on SPIFFS (keep StationData.ini).
+// Deletes: *.adi and RxTxLog.txt
+static esp_err_t delete_logs_on_spiffs_keep_stationdata() {
+  DIR* d = opendir("/spiffs");
+  if (!d) return ESP_FAIL;
+
+  struct dirent* ent;
+  while ((ent = readdir(d)) != nullptr) {
+    const char* name = ent->d_name;
+    if (!name || name[0] == '.') continue;
+
+    if (ends_with_adi(name) || strcmp(name, "RxTxLog.txt") == 0) {
+      std::string path = std::string("/spiffs/") + name;
+      unlink(path.c_str());  // ignore missing/err
+    }
+  }
+  closedir(d);
+  return ESP_OK;
 }
 
 #define CALLSIGN_HASHTABLE_SIZE 256
@@ -488,6 +668,18 @@ static std::vector<std::string> g_ctrl_lines = {
     "LIST/INFO/HELP",
     "EXIT to leave"
 };
+
+static std::vector<std::string> g_startup_lines = {
+    "Mini-FT8 V1.3.2",
+    "S: Status(Operate)",
+    "R: Rx page",
+    "T: Tx page",
+    "M: Menu(Setting)",
+    "Other: Q/C/B/N/O/D"
+};
+
+// Runtime latch: when true, we keep showing the startup screen until any key is pressed.
+static bool g_startup_active = true;
 static std::vector<std::string> g_q_lines;
 static std::vector<std::string> g_q_files;
 static bool g_q_show_entries = false;
@@ -549,6 +741,7 @@ static std::string menu_long_buf;
 static std::string menu_long_backup;
 static int menu_flash_idx = -1;          // absolute index to flash highlight
 static int64_t menu_flash_deadline = 0;  // ms timestamp when flash ends
+static bool menu_delete_confirm = false;  // confirmation state for Delete Logs
 static int rx_flash_idx = -1;
 static int64_t rx_flash_deadline = 0;
 bool g_streaming = false;
@@ -1185,7 +1378,7 @@ static void rtc_tick() {
           draw_status_line(4, std::string("Date: ") + g_date, false);
         }
         if (old_time != g_time) {
-          draw_status_line(5, std::string("UTC:  ") + g_time, false);
+          draw_status_line(5, std::string("Time: ") + g_time, false);
         }
       }
     }
@@ -2124,8 +2317,8 @@ static void draw_menu_view() {
   } else {
     lines.push_back(std::string("RTC Comp:") + std::to_string(g_rtc_comp));
   }
-  lines.push_back(""); // padding
-  lines.push_back(""); // padding
+  lines.push_back("Copy Logs to SD");
+  lines.push_back(menu_delete_confirm ? "Are you sure Y/N?" : "Delete Logs");
 
   int highlight_abs = -1;
   int64_t now = rtc_now_ms();
@@ -2176,9 +2369,9 @@ static void draw_status_view() {
     lines[4] = std::string("Date: ") + g_date;
   }
   if (status_edit_idx == 5 && !status_edit_buffer.empty()) {
-    lines[5] = std::string("UTC: ") + highlight_pos(status_edit_buffer, status_cursor_pos);
+    lines[5] = std::string("Time: ") + highlight_pos(status_edit_buffer, status_cursor_pos);
   } else {
-    lines[5] = std::string("UTC: ") + g_time;
+    lines[5] = std::string("Time: ") + g_time;
   }
   for (int i = 0; i < 6; ++i) {
     bool hl = (status_edit_idx == i);
@@ -2773,6 +2966,7 @@ static void enter_mode(UIMode new_mode) {
       menu_page = 0;
       menu_edit_idx = -1;
       menu_edit_buf.clear();
+      menu_delete_confirm = false;
       draw_menu_view();
       break;
     case UIMode::DEBUG:
@@ -2841,10 +3035,6 @@ static void app_task_core0(void* /*param*/) {
   init_soft_uart();
   ui_init();
   hashtable_init();
-  
-  std::vector<UiRxLine> empty;
-  ui_set_rx_list(empty);
-  ui_draw_rx();
 
   // Initialize autoseq engine
   autoseq_init();
@@ -2856,6 +3046,17 @@ static void app_task_core0(void* /*param*/) {
 
   // Update autoseq with station info after loading
   autoseq_set_station(g_call, g_grid);
+
+  // Prepare RX list (but don't draw yet - startup screen may be shown)
+  std::vector<UiRxLine> empty;
+  ui_set_rx_list(empty);
+
+  if (g_startup_active) {
+    ui_draw_list(g_startup_lines, 0, -1);
+  } else {
+    ui_force_redraw_rx();
+    ui_draw_rx();
+  }
 
   ESP_LOGI(TAG, "Free heap: %u, internal: %u, 8bit: %u",
            heap_caps_get_free_size(MALLOC_CAP_DEFAULT),
@@ -2882,6 +3083,29 @@ static void app_task_core0(void* /*param*/) {
       c = 0x7f;  // treat delete/backspace
     } else if (state.enter) {
       c = '\n';  // enter/return
+    }
+    // Startup screen overlay on RX page: show until any key press, and only once
+    if (g_startup_active) {
+      if (c == 0) {
+        last_key = 0;
+        vTaskDelay(pdMS_TO_TICKS(10));
+        continue;
+      }
+      if (c == last_key) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+        continue;
+      }
+      last_key = c;
+
+      g_startup_active = false;
+      save_station_data();
+
+      // Now show the real RX page; consume this key so it doesn't trigger actions.
+      ui_force_redraw_rx();
+      ui_draw_rx();
+
+      vTaskDelay(pdMS_TO_TICKS(10));
+      continue;
     }
 
     rtc_tick();
@@ -3103,7 +3327,7 @@ static void app_task_core0(void* /*param*/) {
       }
       else if (c == 'q' || c == 'Q') { cancel_status_edit(); enter_mode(ui_mode == UIMode::QSO ? UIMode::RX : UIMode::QSO); switched = true; }
       else if (c == 'h' || c == 'H') { cancel_status_edit(); set_log_to_soft_uart(true); enter_mode(ui_mode == UIMode::HOST ? UIMode::RX : UIMode::HOST); switched = true; }
-      else if (c == '0x03' || c == 'C') { cancel_status_edit(); set_log_to_soft_uart(false); enter_mode(ui_mode == UIMode::CONTROL ? UIMode::RX : UIMode::CONTROL); switched = true; } // changed from press c to control (hold) C
+      else if (c == 'c' || c == 'C') { cancel_status_edit(); set_log_to_soft_uart(false); enter_mode(ui_mode == UIMode::CONTROL ? UIMode::RX : UIMode::CONTROL); switched = true; }
       else if (c == 'd' || c == 'D') { cancel_status_edit(); enter_mode(ui_mode == UIMode::DEBUG ? UIMode::RX : UIMode::DEBUG); switched = true; }
       else if (c == 'l' || c == 'L') { cancel_status_edit(); enter_mode(ui_mode == UIMode::LIST ? UIMode::RX : UIMode::LIST); switched = true; }
       else if (c == 's' || c == 'S') { cancel_status_edit(); enter_mode(ui_mode == UIMode::STATUS ? UIMode::RX : UIMode::STATUS); switched = true; }
@@ -3436,6 +3660,22 @@ static void app_task_core0(void* /*param*/) {
               }
               break;
             }
+            if (menu_delete_confirm) {
+              // Confirmation prompt for "Delete Logs" (page 2 line 6)
+              if (c == 'Y' || c == 'y') {
+                esp_err_t err = delete_logs_on_spiffs_keep_stationdata();
+                menu_delete_confirm = false;
+                menu_flash_idx = 17; // abs index of line 6 on page 2
+                menu_flash_deadline = rtc_now_ms() + 500;
+                debug_log_line(err == ESP_OK ? "Logs deleted" : "Delete failed");
+                draw_menu_view();
+              } else if (c == 'N' || c == 'n' || c == '`') {
+                menu_delete_confirm = false;
+                draw_menu_view();
+              }
+              break;
+            }
+
         if (c == ';') {
           if (menu_page > 0) { menu_page--; draw_menu_view(); }
         } else if (c == '.') {
@@ -3545,6 +3785,22 @@ static void app_task_core0(void* /*param*/) {
               } else if (c == '4') {
                 menu_edit_idx = 15; // RTC Comp line
                 menu_edit_buf = std::to_string(g_rtc_comp);
+                draw_menu_view();
+              } else if (c == '5') {
+                esp_err_t err = copy_logs_spiffs_to_sd_overwrite();
+                menu_flash_idx = 16; // abs index of page 2 line 5
+                menu_flash_deadline = rtc_now_ms() + 500;
+                if (err == ESP_OK) {
+                  debug_log_line("Copied logs to SD");
+                } else {
+                  //char buf[64];
+                  //snprintf(buf, sizeof(buf), "f:%x %s", (unsigned)err, esp_err_to_name(err));
+                  //debug_log_line(buf);
+                }
+
+                draw_menu_view();
+              } else if (c == '6') {
+                menu_delete_confirm = true;
                 draw_menu_view();
               }
             }

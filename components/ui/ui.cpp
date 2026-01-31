@@ -12,15 +12,6 @@ static constexpr int COUNTDOWN_H = 3;
 static constexpr int RX_LINES = 6;
 static bool ui_paused = false;      // waterfall updates paused
 
-static std::vector<std::string> g_startup_lines = {
-    "Mini-FT8 V1.3.1",
-    "S - Status(Operate)",
-    "R - Rx page",
-    "T - Tx page",
-    "M - Menu(Setting)",
-    "Other: Q/C/B/N/O/D"
-};
-
 static uint8_t waterfall[WATERFALL_H][SCREEN_W];
 static int waterfall_head = 0;
 static bool waterfall_dirty = false;
@@ -111,7 +102,6 @@ void ui_init() {
     M5.Display.setRotation(1);
     M5.Display.fillScreen(TFT_BLACK);
     ui_draw_countdown(0.0f, true, 1500);
-    ui_draw_list(g_startup_lines, 0, -1);
 }
 
 void ui_set_waterfall_row(int row, const uint8_t* bins, int len) {
